@@ -16,14 +16,15 @@ fnm use 20
 corepack enable
 
 # Setup Python virtual environment for mssql-py-core development
+WORKSPACE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 echo "Setting up Python virtual environment..."
-python3 -m venv /workspaces/mssql-tds/myvenv
-source /workspaces/mssql-tds/myvenv/bin/activate
+python3 -m venv "$WORKSPACE_DIR/myvenv"
+source "$WORKSPACE_DIR/myvenv/bin/activate"
 
 # Install maturin (build tool) and dev dependencies from pyproject.toml
 pip install --upgrade pip
 pip install maturin
-pip install -e "/workspaces/mssql-tds/mssql-py-core[dev]"
+pip install -e "$WORKSPACE_DIR/mssql-py-core[dev]"
 
-echo "Python venv ready at /workspaces/mssql-tds/myvenv"
-echo "Run 'source /workspaces/mssql-tds/myvenv/bin/activate' to activate"
+echo "Python venv ready at $WORKSPACE_DIR/myvenv"
+echo "Run 'source $WORKSPACE_DIR/myvenv/bin/activate' to activate"
