@@ -15,7 +15,7 @@ use tokio::sync::Mutex;
 use tracing::instrument;
 
 use crate::{
-    binary_row_writer::BinaryRowWriter,
+    binary_row_writer::{BinaryRowWriter, InlineBinaryRowWriter},
     datatypes::datetime::{
         NapiF64, NapiSqlDateTime, NapiSqlDateTime2, NapiSqlDateTimeOffset, NapiSqlTime,
     },
@@ -50,10 +50,20 @@ pub struct ChunkResult {
     pub has_more: bool,
 }
 
+/// Cached metadata for fetch_chunk reuse across calls on the same result set.
+pub(crate) struct CachedChunkMetadata {
+    col_count: u16,
+    col_name_indices: Vec<u32>,
+    col_type_ids: Vec<u8>,
+    string_table: Vec<String>,
+}
+
 #[napi]
 pub struct Connection {
     pub(crate) tds_client: Arc<Mutex<TdsClient>>,
     pub(crate) collation: Option<CollationMetadata>,
+    /// Cached metadata for fetch_chunk to avoid re-computing per chunk.
+    pub(crate) chunk_metadata: Arc<Mutex<Option<CachedChunkMetadata>>>,
 }
 
 impl Debug for Connection {
@@ -244,16 +254,31 @@ impl Connection {
         }
         let result_set = result_set.unwrap();
 
-        let metadata = result_set.get_metadata().clone();
-        let col_count = metadata.len() as u16;
-
-        let mut writer = BinaryRowWriter::new(col_count);
-
-        let col_names: Vec<String> = metadata.iter().map(|m| m.column_name.clone()).collect();
-        let col_name_indices = writer.intern_column_names(&col_names);
-        let col_type_ids: Vec<u8> = metadata.iter().map(|m| m.data_type as u8).collect();
+        // Get or cache metadata
+        let mut meta_guard = self.chunk_metadata.lock().await;
+        if meta_guard.is_none() {
+            let metadata = result_set.get_metadata().clone();
+            let col_count = metadata.len() as u16;
+            let mut tmp_writer = BinaryRowWriter::new(col_count);
+            let col_names: Vec<String> = metadata.iter().map(|m| m.column_name.clone()).collect();
+            let col_name_indices = tmp_writer.intern_column_names(&col_names);
+            let col_type_ids: Vec<u8> = metadata.iter().map(|m| m.data_type as u8).collect();
+            *meta_guard = Some(CachedChunkMetadata {
+                col_count,
+                col_name_indices,
+                col_type_ids,
+                string_table: col_names,
+            });
+        }
+        let col_count = meta_guard.as_ref().unwrap().col_count;
+        let col_name_indices = meta_guard.as_ref().unwrap().col_name_indices.clone();
+        let col_type_ids = meta_guard.as_ref().unwrap().col_type_ids.clone();
 
         let budget = byte_budget as usize;
+        let mut writer = BinaryRowWriter::new(col_count);
+        // Pre-intern column names so they're in the string table
+        let col_names = meta_guard.as_ref().unwrap().string_table.clone();
+        writer.intern_column_names(&col_names);
         let mut has_more = false;
 
         loop {
@@ -263,6 +288,7 @@ impl Connection {
                 .map_err(|e| napi::Error::from_reason(format!("Failed to read row: {e}")))?;
 
             if !had_row {
+                *meta_guard = None;
                 break;
             }
 
@@ -273,7 +299,11 @@ impl Connection {
         }
 
         Ok(Some(ChunkResult {
-            data: Buffer::from(writer.finalize(&col_name_indices, &col_type_ids, 0)),
+            data: Buffer::from(writer.finalize(
+                &col_name_indices,
+                &col_type_ids,
+                0,
+            )),
             has_more,
         }))
     }

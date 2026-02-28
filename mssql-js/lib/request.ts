@@ -177,7 +177,7 @@ export class Request {
   }
 
   private async createResultFast(): Promise<IResult> {
-    const BYTE_BUDGET = 256 * 1024;
+    const BYTE_BUDGET = 4 * 1024 * 1024;
     const rawResults: RawResult[] = [];
 
     while (true) {
