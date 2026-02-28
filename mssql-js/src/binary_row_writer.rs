@@ -35,6 +35,7 @@ const TAG_DATETIME2: u8 = 16;
 const TAG_DATETIMEOFFSET: u8 = 17;
 const TAG_MONEY: u8 = 18;
 const TAG_SMALLMONEY: u8 = 19;
+const TAG_STRING_INLINE: u8 = 20;
 
 /// Binary buffer format version.
 const FORMAT_VERSION: u8 = 1;
@@ -336,4 +337,123 @@ impl BinaryRowWriter {
     pub fn row_data_len(&self) -> usize {
         self.row_data.len()
     }
+}
+
+/// A variant of BinaryRowWriter that writes strings inline (no interning).
+/// Used for fetch_chunk where chunks are small and string dedup has low ROI.
+pub(crate) struct InlineBinaryRowWriter {
+    row_data: Vec<u8>,
+    row_count: u32,
+    col_count: u16,
+}
+
+impl InlineBinaryRowWriter {
+    pub fn new(col_count: u16, capacity: usize) -> Self {
+        Self {
+            row_data: Vec::with_capacity(capacity),
+            row_count: 0,
+            col_count,
+        }
+    }
+
+    pub fn row_data_len(&self) -> usize {
+        self.row_data.len()
+    }
+
+    /// Assemble buffer with pre-cached column name string table.
+    pub fn finalize(
+        self,
+        col_name_indices: &[u32],
+        col_type_ids: &[u8],
+        string_table: &[String],
+        rows_affected: i32,
+    ) -> Vec<u8> {
+        let mut str_data = Vec::new();
+        let mut str_offsets: Vec<(u32, u32)> = Vec::with_capacity(string_table.len());
+        for s in string_table {
+            let offset = str_data.len() as u32;
+            let bytes = s.as_bytes();
+            str_data.extend_from_slice(bytes);
+            str_offsets.push((offset, bytes.len() as u32));
+        }
+
+        let col_desc_size = (self.col_count as usize) * 5;
+        let str_table_header = 4 + string_table.len() * 8;
+        let string_table_offset = (HEADER_SIZE + col_desc_size) as u32;
+        let total =
+            HEADER_SIZE + col_desc_size + str_table_header + str_data.len() + self.row_data.len();
+
+        let mut buf = Vec::with_capacity(total);
+
+        buf.extend_from_slice(&MAGIC.to_le_bytes());
+        buf.push(FORMAT_VERSION);
+        buf.extend_from_slice(&self.col_count.to_le_bytes());
+        buf.extend_from_slice(&self.row_count.to_le_bytes());
+        buf.extend_from_slice(&string_table_offset.to_le_bytes());
+        buf.extend_from_slice(&rows_affected.to_le_bytes());
+
+        for i in 0..self.col_count as usize {
+            let name_idx = col_name_indices.get(i).copied().unwrap_or(0);
+            let type_id = col_type_ids.get(i).copied().unwrap_or(0);
+            buf.extend_from_slice(&name_idx.to_le_bytes());
+            buf.push(type_id);
+        }
+
+        buf.extend_from_slice(&(string_table.len() as u32).to_le_bytes());
+        for (offset, len) in &str_offsets {
+            buf.extend_from_slice(&offset.to_le_bytes());
+            buf.extend_from_slice(&len.to_le_bytes());
+        }
+        buf.extend_from_slice(&str_data);
+        buf.extend_from_slice(&self.row_data);
+
+        buf
+    }
+}
+
+impl RowWriter for InlineBinaryRowWriter {
+    fn write_null(&mut self, _col: usize) { self.row_data.push(TAG_NULL); }
+    fn write_bool(&mut self, _col: usize, val: bool) { self.row_data.push(TAG_BOOL); self.row_data.push(val as u8); }
+    fn write_u8(&mut self, _col: usize, val: u8) { self.row_data.push(TAG_U8); self.row_data.push(val); }
+    fn write_i16(&mut self, _col: usize, val: i16) { self.row_data.push(TAG_I16); self.row_data.extend_from_slice(&val.to_le_bytes()); }
+    fn write_i32(&mut self, _col: usize, val: i32) { self.row_data.push(TAG_I32); self.row_data.extend_from_slice(&val.to_le_bytes()); }
+    fn write_i64(&mut self, _col: usize, val: i64) { self.row_data.push(TAG_I64); self.row_data.extend_from_slice(&val.to_le_bytes()); }
+    fn write_f32(&mut self, _col: usize, val: f32) { self.row_data.push(TAG_F32); self.row_data.extend_from_slice(&val.to_le_bytes()); }
+    fn write_f64(&mut self, _col: usize, val: f64) { self.row_data.push(TAG_F64); self.row_data.extend_from_slice(&val.to_le_bytes()); }
+    fn write_string(&mut self, _col: usize, val: SqlString) {
+        let utf8 = val.to_utf8_string();
+        let bytes = utf8.as_bytes();
+        self.row_data.push(TAG_STRING_INLINE);
+        self.row_data.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        self.row_data.extend_from_slice(bytes);
+    }
+    fn write_bytes(&mut self, _col: usize, val: Vec<u8>) { self.row_data.push(TAG_BYTES); self.row_data.extend_from_slice(&(val.len() as u32).to_le_bytes()); self.row_data.extend_from_slice(&val); }
+    fn write_decimal(&mut self, _col: usize, val: DecimalParts) {
+        self.row_data.push(TAG_DECIMAL); self.row_data.push(val.is_positive as u8); self.row_data.push(val.scale); self.row_data.push(val.precision); self.row_data.push(val.int_parts.len() as u8);
+        for part in &val.int_parts { self.row_data.extend_from_slice(&part.to_le_bytes()); }
+    }
+    fn write_numeric(&mut self, _col: usize, val: DecimalParts) {
+        self.row_data.push(TAG_DECIMAL); self.row_data.push(val.is_positive as u8); self.row_data.push(val.scale); self.row_data.push(val.precision); self.row_data.push(val.int_parts.len() as u8);
+        for part in &val.int_parts { self.row_data.extend_from_slice(&part.to_le_bytes()); }
+    }
+    fn write_date(&mut self, _col: usize, val: SqlDate) { self.row_data.push(TAG_DATE); self.row_data.extend_from_slice(&val.get_days().to_le_bytes()); }
+    fn write_time(&mut self, _col: usize, val: SqlTime) { self.row_data.push(TAG_TIME); self.row_data.push(val.scale); self.row_data.extend_from_slice(&val.time_nanoseconds.to_le_bytes()); }
+    fn write_datetime(&mut self, _col: usize, val: SqlDateTime) { self.row_data.push(TAG_DATETIME); self.row_data.extend_from_slice(&val.days.to_le_bytes()); self.row_data.extend_from_slice(&val.time.to_le_bytes()); }
+    fn write_smalldatetime(&mut self, _col: usize, val: SqlSmallDateTime) { self.row_data.push(TAG_SMALLDATETIME); self.row_data.extend_from_slice(&val.days.to_le_bytes()); self.row_data.extend_from_slice(&val.time.to_le_bytes()); }
+    fn write_datetime2(&mut self, _col: usize, val: SqlDateTime2) { self.row_data.push(TAG_DATETIME2); self.row_data.push(val.time.scale); self.row_data.extend_from_slice(&val.time.time_nanoseconds.to_le_bytes()); self.row_data.extend_from_slice(&val.days.to_le_bytes()); }
+    fn write_datetimeoffset(&mut self, _col: usize, val: SqlDateTimeOffset) { self.row_data.push(TAG_DATETIMEOFFSET); self.row_data.push(val.datetime2.time.scale); self.row_data.extend_from_slice(&val.datetime2.time.time_nanoseconds.to_le_bytes()); self.row_data.extend_from_slice(&val.datetime2.days.to_le_bytes()); self.row_data.extend_from_slice(&val.offset.to_le_bytes()); }
+    fn write_money(&mut self, _col: usize, val: SqlMoney) { self.row_data.push(TAG_MONEY); self.row_data.extend_from_slice(&val.lsb_part.to_le_bytes()); self.row_data.extend_from_slice(&val.msb_part.to_le_bytes()); }
+    fn write_smallmoney(&mut self, _col: usize, val: SqlSmallMoney) { self.row_data.push(TAG_SMALLMONEY); self.row_data.extend_from_slice(&val.int_val.to_le_bytes()); }
+    fn write_uuid(&mut self, _col: usize, val: Uuid) { self.row_data.push(TAG_UUID); self.row_data.extend_from_slice(val.as_bytes()); }
+    fn write_xml(&mut self, _col: usize, val: SqlXml) { let utf8 = val.as_string(); let bytes = utf8.as_bytes(); self.row_data.push(TAG_STRING_INLINE); self.row_data.extend_from_slice(&(bytes.len() as u32).to_le_bytes()); self.row_data.extend_from_slice(bytes); }
+    fn write_json(&mut self, _col: usize, val: SqlJson) { let utf8 = val.as_string(); let bytes = utf8.as_bytes(); self.row_data.push(TAG_STRING_INLINE); self.row_data.extend_from_slice(&(bytes.len() as u32).to_le_bytes()); self.row_data.extend_from_slice(bytes); }
+    fn write_vector(&mut self, _col: usize, val: SqlVector) {
+        self.row_data.push(TAG_BYTES);
+        if let Some(floats) = val.as_f32() {
+            let byte_len = (floats.len() * 4) as u32;
+            self.row_data.extend_from_slice(&byte_len.to_le_bytes());
+            for f in floats { self.row_data.extend_from_slice(&f.to_le_bytes()); }
+        } else { self.row_data.extend_from_slice(&0u32.to_le_bytes()); }
+    }
+    fn end_row(&mut self) { self.row_count += 1; }
 }
