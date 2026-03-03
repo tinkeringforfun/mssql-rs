@@ -1,0 +1,30 @@
+{
+  "properties": {
+    "helpUri": "https://eng.ms/docs/microsoft-security/security/azure-security/cloudai-security-fundamentals-engineering/security-integration/guardian-wiki/microsoft-guardian/general/baselines"
+  },
+  "version": "1.0.0",
+  "baselines": {
+    "default": {
+      "name": "default",
+      "createdDate": "2026-02-26 00:52:39Z",
+      "lastUpdatedDate": "2026-02-26 00:52:39Z"
+    }
+  },
+  "results": {
+    "bd1ce7227025d22a25d3d98df0aef3b236e0aa4987f80c43874a2afc3e3713a0": {
+      "signature": "bd1ce7227025d22a25d3d98df0aef3b236e0aa4987f80c43874a2afc3e3713a0",
+      "alternativeSignatures": [],
+      "target": "mssql-py-core/tests/mssql_python/test_bulkcopy_access_token.py",
+      "line": 443,
+      "uriBaseId": "file:///D:/a/_work/1/s/",
+      "memberOf": [
+        "default"
+      ],
+      "tool": "credscan",
+      "ruleId": "CSCAN-GENERAL0030",
+      "createdDate": "2026-02-26 00:52:39Z",
+      "expirationDate": "2026-08-15 00:54:08Z",
+      "justification": "This error is baselined with an expiration date of 180 days from 2026-02-26 00:54:08Z"
+    }
+  }
+}
