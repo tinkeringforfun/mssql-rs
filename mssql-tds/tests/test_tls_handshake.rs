@@ -99,6 +99,28 @@ async fn trust_cert_encrypt_optional() {
     );
 }
 
+/// TrustServerCertificate=false + PreferOff (Encrypt=Optional).
+/// When the server doesn't force encryption, the negotiated mode is LoginOnly.
+/// ODBC skips cert validation for LoginOnly regardless of TrustServerCertificate.
+/// This test verifies the Rust driver matches that behavior: LoginOnly connections
+/// should succeed even with TrustServerCertificate=false against self-signed certs.
+#[tokio::test]
+async fn no_trust_cert_encrypt_optional() {
+    let ctx = sql_auth_context(false, EncryptionSetting::PreferOff);
+    let datasource = build_tcp_datasource();
+    let provider = TdsConnectionProvider {};
+    let result = provider.create_client(ctx, &datasource, None).await;
+    match &result {
+        Ok(_) => println!("no_trust_cert_encrypt_optional: CONNECTED OK"),
+        Err(e) => println!("no_trust_cert_encrypt_optional: FAILED: {e}"),
+    }
+    assert!(
+        result.is_ok(),
+        "Expected connection to succeed: {:?}",
+        result.err()
+    );
+}
+
 /// Use the standard create_context() helper (reads TRUST_SERVER_CERTIFICATE env).
 /// This mirrors the common test path and should work with TRUST_SERVER_CERTIFICATE=true.
 #[tokio::test]

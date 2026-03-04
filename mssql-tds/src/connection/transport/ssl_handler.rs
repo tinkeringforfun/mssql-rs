@@ -15,9 +15,15 @@ use tokio_native_tls::TlsStream;
 use tracing::{debug, error, info, warn};
 
 use super::network_transport::PRE_NEGOTIATED_PACKET_SIZE;
-use crate::core::{EncryptionOptions, EncryptionSetting, TdsResult};
+use crate::core::{EncryptionOptions, EncryptionSetting, NegotiatedEncryptionSetting, TdsResult};
 #[cfg(target_os = "macos")]
 use std::io::{ErrorKind, Write};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TlsValidationConfig {
+    pub accept_invalid_certs: bool,
+    pub accept_invalid_hostnames: bool,
+}
 
 #[derive(Debug)]
 pub(crate) struct SslHandler {
@@ -26,9 +32,43 @@ pub(crate) struct SslHandler {
 }
 
 impl SslHandler {
+    /// Determine TLS certificate validation behavior based on encryption options
+    /// and the negotiated encryption mode.
+    pub(crate) fn resolve_tls_validation(
+        encryption_options: &EncryptionOptions,
+        negotiated_encryption: NegotiatedEncryptionSetting,
+    ) -> TlsValidationConfig {
+        if encryption_options.server_certificate.is_some() {
+            // Certificate pinning mode: bypass CA validation, custom check later
+            TlsValidationConfig {
+                accept_invalid_certs: true,
+                accept_invalid_hostnames: true,
+            }
+        } else if negotiated_encryption == NegotiatedEncryptionSetting::LoginOnly {
+            // ODBC parity: LoginOnly skips cert validation unconditionally
+            TlsValidationConfig {
+                accept_invalid_certs: true,
+                accept_invalid_hostnames: false,
+            }
+        } else if encryption_options.trust_server_certificate
+            && encryption_options.mode != EncryptionSetting::Strict
+        {
+            TlsValidationConfig {
+                accept_invalid_certs: true,
+                accept_invalid_hostnames: false,
+            }
+        } else {
+            TlsValidationConfig {
+                accept_invalid_certs: false,
+                accept_invalid_hostnames: false,
+            }
+        }
+    }
+
     pub(crate) async fn enable_ssl_async(
         &self,
         mut base_stream: Box<dyn Stream>,
+        negotiated_encryption: NegotiatedEncryptionSetting,
     ) -> TdsResult<Box<dyn Stream>> {
         base_stream.tls_handshake_starting();
 
@@ -51,27 +91,24 @@ impl SslHandler {
             ));
         }
 
-        // Build the native TlsConnector directly because tokio-native-tls's version
-        // is missing some functionality.
+        // Log TrustServerCertificate being ignored in Strict mode
+        if self.encryption_options.trust_server_certificate
+            && self.encryption_options.mode == EncryptionSetting::Strict
+        {
+            warn!(
+                "TrustServerCertificate is ignored for Strict encryption mode. Certificate validation will be enforced."
+            );
+        }
+
         let mut builder = NativeTlsConnector::builder();
 
-        // When ServerCertificate is specified, we bypass CA validation
-        // and perform custom certificate pinning instead
-        if self.encryption_options.server_certificate.is_some() {
-            info!("ServerCertificate specified, enabling certificate pinning mode");
+        let validation =
+            Self::resolve_tls_validation(&self.encryption_options, negotiated_encryption);
+        if validation.accept_invalid_certs {
             builder.danger_accept_invalid_certs(true);
+        }
+        if validation.accept_invalid_hostnames {
             builder.danger_accept_invalid_hostnames(true);
-        } else if self.encryption_options.trust_server_certificate {
-            // For Strict encryption mode (TDS 8.0), TrustServerCertificate is ignored.
-            // Certificate validation must always be enforced for Strict mode.
-            if self.encryption_options.mode == EncryptionSetting::Strict {
-                warn!(
-                    "TrustServerCertificate is ignored for Strict encryption mode. Certificate validation will be enforced."
-                );
-            } else {
-                info!("TrustServerCertificate=true: accepting invalid certs");
-                builder.danger_accept_invalid_certs(true);
-            }
         }
 
         let host_name = self
@@ -707,5 +744,96 @@ impl AsyncWrite for BufferedTdsStream {
             let write_res = Write::write_vectored(&mut self.buffer.as_mut().unwrap(), bufs);
             Poll::Ready(write_res)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn default_options() -> EncryptionOptions {
+        EncryptionOptions {
+            mode: EncryptionSetting::Required,
+            trust_server_certificate: false,
+            host_name_in_cert: None,
+            server_certificate: None,
+        }
+    }
+
+    #[test]
+    fn login_only_skips_cert_validation() {
+        let opts = default_options();
+        let config =
+            SslHandler::resolve_tls_validation(&opts, NegotiatedEncryptionSetting::LoginOnly);
+        assert!(config.accept_invalid_certs);
+        assert!(!config.accept_invalid_hostnames);
+    }
+
+    #[test]
+    fn login_only_skips_cert_validation_even_with_trust_false() {
+        let mut opts = default_options();
+        opts.trust_server_certificate = false;
+        opts.mode = EncryptionSetting::PreferOff;
+        let config =
+            SslHandler::resolve_tls_validation(&opts, NegotiatedEncryptionSetting::LoginOnly);
+        assert!(config.accept_invalid_certs);
+    }
+
+    #[test]
+    fn mandatory_without_trust_enforces_validation() {
+        let opts = default_options();
+        let config =
+            SslHandler::resolve_tls_validation(&opts, NegotiatedEncryptionSetting::Mandatory);
+        assert!(!config.accept_invalid_certs);
+        assert!(!config.accept_invalid_hostnames);
+    }
+
+    #[test]
+    fn mandatory_with_trust_skips_cert_validation() {
+        let mut opts = default_options();
+        opts.trust_server_certificate = true;
+        let config =
+            SslHandler::resolve_tls_validation(&opts, NegotiatedEncryptionSetting::Mandatory);
+        assert!(config.accept_invalid_certs);
+        assert!(!config.accept_invalid_hostnames);
+    }
+
+    #[test]
+    fn strict_ignores_trust_server_certificate() {
+        let mut opts = default_options();
+        opts.mode = EncryptionSetting::Strict;
+        opts.trust_server_certificate = true;
+        let config = SslHandler::resolve_tls_validation(&opts, NegotiatedEncryptionSetting::Strict);
+        assert!(!config.accept_invalid_certs);
+        assert!(!config.accept_invalid_hostnames);
+    }
+
+    #[test]
+    fn server_certificate_enables_pinning_mode() {
+        let mut opts = default_options();
+        opts.server_certificate = Some("cert.pem".to_string());
+        let config =
+            SslHandler::resolve_tls_validation(&opts, NegotiatedEncryptionSetting::Mandatory);
+        assert!(config.accept_invalid_certs);
+        assert!(config.accept_invalid_hostnames);
+    }
+
+    #[test]
+    fn server_certificate_takes_precedence_over_login_only() {
+        let mut opts = default_options();
+        opts.server_certificate = Some("cert.pem".to_string());
+        let config =
+            SslHandler::resolve_tls_validation(&opts, NegotiatedEncryptionSetting::LoginOnly);
+        assert!(config.accept_invalid_certs);
+        assert!(config.accept_invalid_hostnames);
+    }
+
+    #[test]
+    fn no_encryption_enforces_validation() {
+        let opts = default_options();
+        let config =
+            SslHandler::resolve_tls_validation(&opts, NegotiatedEncryptionSetting::NoEncryption);
+        assert!(!config.accept_invalid_certs);
+        assert!(!config.accept_invalid_hostnames);
     }
 }

@@ -348,7 +348,9 @@ async fn create_transport_for_version(
             // Enable TLS immediately for TDS 8.0 (before any TDS packets are exchanged)
             info!("Creating NetworkTransport for TDS 8.0 with immediate TLS");
 
-            let encrypted_stream = ssl_handler.enable_ssl_async(stream).await?;
+            let encrypted_stream = ssl_handler
+                .enable_ssl_async(stream, NegotiatedEncryptionSetting::Strict)
+                .await?;
 
             Ok(Box::new(NetworkTransport::new(
                 encrypted_stream,
@@ -611,9 +613,12 @@ impl NetworkTransport {
 
         // Perform TLS handshake (consumes extractable_stream, returns TlsStream)
         // enable_ssl_async will call tls_handshake_starting and tls_handshake_completed internally
+        let negotiated = self
+            .encryption
+            .unwrap_or(NegotiatedEncryptionSetting::Mandatory);
         let encrypted_stream = self
             .ssl_handler
-            .enable_ssl_async(Box::new(extractable_stream))
+            .enable_ssl_async(Box::new(extractable_stream), negotiated)
             .await?;
 
         // Put back the encrypted stream
