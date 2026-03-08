@@ -533,16 +533,9 @@ impl ArrowQueryReader {
         let mut reader = Self::from_metadata(&metadata, batch_size)?;
         let mut batches = Vec::new();
 
-        while client.next_row_into(&mut reader).await? {
-            if reader.is_batch_ready() {
-                if let Some(batch) = reader.finish()? {
-                    batches.push(batch);
-                }
-                reader = Self::from_metadata(&metadata, batch_size)?;
-            }
-        }
+        // Use bulk read — single metadata clone, no per-row timeout/tracing
+        client.read_all_rows_into(&mut reader).await?;
 
-        // Flush remaining rows
         if reader.row_count() > 0
             && let Some(batch) = reader.finish()?
         {

@@ -1047,6 +1047,79 @@ impl TdsClient {
         }
     }
 
+    /// Reads all remaining rows from the current result set into a [`RowWriter`]
+    /// in a tight loop, minimizing per-row overhead.
+    ///
+    /// Compared to calling `get_next_row_into` per row, this method:
+    /// - Clones metadata **once** instead of per-row
+    /// - Skips per-row `Instant::now()` / timeout tracking
+    /// - Avoids per-row tracing overhead
+    ///
+    /// Returns the number of rows written.
+    pub(crate) async fn read_all_rows_into(
+        &mut self,
+        writer: &mut (dyn RowWriter + Send),
+    ) -> TdsResult<usize> {
+        if self.current_metadata.is_none() {
+            return Err(UsageError(
+                "No metadata found. Have you called execute?".to_string(),
+            ));
+        }
+        let parser_context = ParserContext::ColumnMetadata(self.current_metadata.clone().unwrap());
+        let mut row_count: usize = 0;
+
+        loop {
+            let result = self
+                .transport
+                .receive_row_into(
+                    &parser_context,
+                    self.remaining_request_timeout,
+                    self.cancel_handle.as_ref(),
+                    writer,
+                )
+                .await?;
+
+            match result {
+                RowReadResult::RowWritten => {
+                    writer.end_row();
+                    row_count += 1;
+                }
+                RowReadResult::Token(token) => match token {
+                    Tokens::DoneInProc(done) | Tokens::DoneProc(done) | Tokens::Done(done) => {
+                        let count = self.count_map.entry(done.cur_cmd).or_insert(0);
+                        *count = count.saturating_add(done.row_count);
+                        self.current_result_set_has_been_read_till_end = true;
+                        if !done.has_more() {
+                            self.execution_context.set_has_open_batch(false);
+                        }
+                        return Ok(row_count);
+                    }
+                    Tokens::Order(_) | Tokens::EnvChange(_) => continue,
+                    Tokens::ReturnValue(rv) => {
+                        self.return_values.push(rv.into());
+                        continue;
+                    }
+                    Tokens::Error(error_token) => {
+                        return Err(crate::error::Error::SqlServerError {
+                            message: error_token.message.clone(),
+                            state: error_token.state,
+                            class: error_token.severity as i32,
+                            number: error_token.number,
+                            server_name: Some(error_token.server_name.clone()),
+                            proc_name: Some(error_token.proc_name.clone()),
+                            line_number: Some(error_token.line_number as i32),
+                        });
+                    }
+                    _ => {
+                        return Err(crate::error::Error::ProtocolError(format!(
+                            "Unexpected token while reading rows: {token:?}"
+                        )));
+                    }
+                },
+            }
+        }
+    }
+
     /// Gets the return values collected so far.
     pub fn get_return_values(&self) -> Vec<ReturnValue> {
         self.return_values.clone()
@@ -1332,6 +1405,18 @@ impl ResultSet for TdsClient {
         !self.current_result_set_has_been_read_till_end
     }
 
+    #[instrument(skip(self, writer), level = "info")]
+    async fn read_all_rows_into(
+        &mut self,
+        writer: &mut (dyn RowWriter + Send),
+    ) -> TdsResult<usize> {
+        if self.maybe_has_unread_rows() {
+            TdsClient::read_all_rows_into(self, writer).await
+        } else {
+            Ok(0)
+        }
+    }
+
     #[instrument(skip(self), level = "info")]
     async fn close(&mut self) -> TdsResult<()> {
         self.close_query().await
@@ -1400,6 +1485,14 @@ pub trait ResultSet {
     async fn next_row_into(&mut self, writer: &mut (dyn RowWriter + Send)) -> TdsResult<bool>;
 
     fn maybe_has_unread_rows(&self) -> bool;
+
+    /// Reads all remaining rows into a [`RowWriter`] in a tight loop.
+    /// Returns the number of rows read. Minimizes per-row overhead
+    /// (no per-row timeout tracking, no per-row tracing).
+    async fn read_all_rows_into(
+        &mut self,
+        writer: &mut (dyn RowWriter + Send),
+    ) -> TdsResult<usize>;
 
     /// Iterates over the result set, and marks it as closed. After calling close, the next_row method,
     /// will always return None.
