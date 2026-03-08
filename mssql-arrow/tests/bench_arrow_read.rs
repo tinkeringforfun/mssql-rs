@@ -13,7 +13,7 @@
 //!
 //! Run with:
 //!   DB_HOST=localhost DB_USERNAME=sa SQL_PASSWORD=<pw> TRUST_SERVER_CERTIFICATE=true \
-//!     cargo nextest run -p mssql-arrow --test bench_arrow_read -- --ignored
+//!     cargo test -p mssql-arrow --test bench_arrow_read -- --ignored --nocapture
 
 mod common;
 
@@ -21,13 +21,12 @@ use arrow_array::builder::{
     Decimal128Builder, Float64Builder, Int32Builder, Int64Builder, StringBuilder,
 };
 use arrow_array::RecordBatch;
-use arrow_schema::{DataType, Field, Schema, TimeUnit};
+use arrow_schema::{DataType, Field, Schema};
 use common::{begin_connection, build_tcp_datasource};
 use mssql_arrow::ArrowQueryReader;
-use mssql_tds::connection::tds_client::TdsClient;
+use mssql_tds::connection::tds_client::{ResultSet, TdsClient};
 use mssql_tds::core::TdsResult;
 use mssql_tds::datatypes::column_values::ColumnValues;
-use mssql_tds::datatypes::decoder::DecimalParts;
 use mssql_tds::datatypes::row_writer::DefaultRowWriter;
 use std::sync::Arc;
 use std::time::Instant;
@@ -44,10 +43,12 @@ const NUM_ITERATIONS: usize = 10;
 // ---------------------------------------------------------------------------
 
 async fn setup_table(client: &mut TdsClient) -> TdsResult<()> {
-    // Create temp table
     client
         .execute(
-            "IF OBJECT_ID('tempdb..#arrow_read_bench') IS NOT NULL DROP TABLE #arrow_read_bench",
+            "IF OBJECT_ID('tempdb..#arrow_read_bench') IS NOT NULL DROP TABLE #arrow_read_bench"
+                .to_string(),
+            None,
+            None,
         )
         .await?;
     client.close_query().await?;
@@ -60,7 +61,10 @@ async fn setup_table(client: &mut TdsClient) -> TdsResult<()> {
                 price   FLOAT         NOT NULL,
                 name    NVARCHAR(200) NOT NULL,
                 total   DECIMAL(18,2) NOT NULL
-            )",
+            )"
+            .to_string(),
+            None,
+            None,
         )
         .await?;
     client.close_query().await?;
@@ -85,7 +89,7 @@ async fn setup_table(client: &mut TdsClient) -> TdsResult<()> {
                 CAST(n * 100.00 + 123.45 AS DECIMAL(18,2))
             FROM nums"
         );
-        client.execute(&sql).await?;
+        client.execute(sql, None, None).await?;
         client.close_query().await?;
     }
 
@@ -98,7 +102,11 @@ async fn setup_table(client: &mut TdsClient) -> TdsResult<()> {
 
 async fn read_direct_arrow(client: &mut TdsClient) -> TdsResult<(Vec<RecordBatch>, u64)> {
     client
-        .execute("SELECT id, amount, price, name, total FROM #arrow_read_bench")
+        .execute(
+            "SELECT id, amount, price, name, total FROM #arrow_read_bench".to_string(),
+            None,
+            None,
+        )
         .await?;
 
     let start = Instant::now();
@@ -131,7 +139,11 @@ fn column_values_to_i128(cv: &ColumnValues) -> i128 {
 
 async fn read_materialized_arrow(client: &mut TdsClient) -> TdsResult<(Vec<RecordBatch>, u64)> {
     client
-        .execute("SELECT id, amount, price, name, total FROM #arrow_read_bench")
+        .execute(
+            "SELECT id, amount, price, name, total FROM #arrow_read_bench".to_string(),
+            None,
+            None,
+        )
         .await?;
 
     let start = Instant::now();
@@ -159,29 +171,24 @@ async fn read_materialized_arrow(client: &mut TdsClient) -> TdsResult<(Vec<Recor
     for row in &all_rows {
         match &row[0] {
             ColumnValues::Int(v) => id_builder.append_value(*v),
-            ColumnValues::Null => id_builder.append_null(),
             _ => id_builder.append_null(),
         }
         match &row[1] {
             ColumnValues::BigInt(v) => amount_builder.append_value(*v),
-            ColumnValues::Null => amount_builder.append_null(),
             _ => amount_builder.append_null(),
         }
         match &row[2] {
             ColumnValues::Float(v) => price_builder.append_value(*v),
-            ColumnValues::Null => price_builder.append_null(),
             _ => price_builder.append_null(),
         }
         match &row[3] {
             ColumnValues::String(v) => name_builder.append_value(v.to_string()),
-            ColumnValues::Null => name_builder.append_null(),
             _ => name_builder.append_null(),
         }
         match &row[4] {
             ColumnValues::Decimal(_) | ColumnValues::Numeric(_) => {
                 total_builder.append_value(column_values_to_i128(&row[4]));
             }
-            ColumnValues::Null => total_builder.append_null(),
             _ => total_builder.append_null(),
         }
     }
@@ -212,12 +219,16 @@ async fn read_materialized_arrow(client: &mut TdsClient) -> TdsResult<(Vec<Recor
 }
 
 // ---------------------------------------------------------------------------
-// Path C: next_row() → Vec<ColumnValues> (no Arrow, baseline)
+// Path C: next_row_into() → Vec<ColumnValues> (no Arrow, baseline)
 // ---------------------------------------------------------------------------
 
 async fn read_materialized_only(client: &mut TdsClient) -> TdsResult<(usize, u64)> {
     client
-        .execute("SELECT id, amount, price, name, total FROM #arrow_read_bench")
+        .execute(
+            "SELECT id, amount, price, name, total FROM #arrow_read_bench".to_string(),
+            None,
+            None,
+        )
         .await?;
 
     let start = Instant::now();
@@ -320,7 +331,10 @@ async fn bench_arrow_read() -> TdsResult<()> {
         "  {:20} {:>10} {:>12} {:>15} {:>10}",
         "Path", "Avg (ms)", "Warm Avg", "Krows/s (warm)", "Speedup"
     );
-    println!("  {:-<20} {:-<10} {:-<12} {:-<15} {:-<10}", "", "", "", "", "");
+    println!(
+        "  {:-<20} {:-<10} {:-<12} {:-<15} {:-<10}",
+        "", "", "", "", ""
+    );
     println!(
         "  {:20} {:>10.1} {:>12.1} {:>15.1} {:>10}",
         "A — Direct (Arrow)",
@@ -346,12 +360,22 @@ async fn bench_arrow_read() -> TdsResult<()> {
         format!("{:.2}×", warm_materialized / warm_raw)
     );
 
-    println!("\n  Arrow conversion overhead (B warm - C warm): {:.1} ms", warm_materialized - warm_raw);
-    println!("  Direct overhead vs raw (A warm - C warm): {:.1} ms", warm_direct - warm_raw);
+    println!(
+        "\n  Arrow conversion overhead (B warm - C warm): {:.1} ms",
+        warm_materialized - warm_raw
+    );
+    println!(
+        "  Direct overhead vs raw (A warm - C warm): {:.1} ms",
+        warm_direct - warm_raw
+    );
 
     // Cleanup
     client
-        .execute("DROP TABLE IF EXISTS #arrow_read_bench")
+        .execute(
+            "DROP TABLE IF EXISTS #arrow_read_bench".to_string(),
+            None,
+            None,
+        )
         .await?;
     client.close_query().await?;
 
