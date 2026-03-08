@@ -1471,6 +1471,14 @@ impl crate::connection::transport::tds_transport::TdsTransport for NetworkTransp
         // Wait for ACK with timeout using the shared helper
         self.wait_for_attention_ack(Some(attention_timeout)).await
     }
+
+    async fn receive_row_into_raw(
+        &mut self,
+        context: &ParserContext,
+        writer: &mut (dyn RowWriter + Send),
+    ) -> TdsResult<RowReadResult> {
+        self.receive_row_into_internal(context, writer).await
+    }
 }
 
 #[cfg(test)]

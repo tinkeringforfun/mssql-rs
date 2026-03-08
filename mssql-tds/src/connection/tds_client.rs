@@ -1071,10 +1071,8 @@ impl TdsClient {
         loop {
             let result = self
                 .transport
-                .receive_row_into(
+                .receive_row_into_raw(
                     &parser_context,
-                    self.remaining_request_timeout,
-                    self.cancel_handle.as_ref(),
                     writer,
                 )
                 .await?;

@@ -5,8 +5,9 @@
 //! This allows for different implementations (real network, mock for testing/fuzzing, etc.)
 
 use crate::core::TdsResult;
+use crate::datatypes::row_writer::RowWriter;
 use crate::io::reader_writer::NetworkWriter;
-use crate::io::token_stream::TdsTokenStreamReader;
+use crate::io::token_stream::{ParserContext, RowReadResult, TdsTokenStreamReader};
 use async_trait::async_trait;
 use std::time::Duration;
 
@@ -50,4 +51,12 @@ pub(crate) trait TdsTransport: TdsTokenStreamReader + Send + Sync + std::fmt::De
     /// * `Ok(false)` - Attention sent but timeout expired waiting for ACK
     /// * `Err(_)` - Error sending attention or reading response
     async fn send_attention_with_timeout(&mut self, timeout: Duration) -> TdsResult<bool>;
+
+    /// Read the next row/token directly without cancel/timeout wrapping.
+    /// Used by bulk-read paths where cancel/timeout is checked less frequently.
+    async fn receive_row_into_raw(
+        &mut self,
+        context: &ParserContext,
+        writer: &mut (dyn RowWriter + Send),
+    ) -> TdsResult<RowReadResult>;
 }
