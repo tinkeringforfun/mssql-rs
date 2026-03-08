@@ -909,11 +909,6 @@ impl NetworkTransport {
     ) -> TdsResult<RowReadResult> {
         let token_type_byte = self.read_byte().await?;
         let token_type: TokenType = token_type_byte.try_into()?;
-        event!(
-            tracing::Level::DEBUG,
-            "Parsing token type: {:?}",
-            &token_type
-        );
 
         match token_type {
             TokenType::Row => {
