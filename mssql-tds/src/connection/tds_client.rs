@@ -1066,56 +1066,48 @@ impl TdsClient {
             ));
         }
         let parser_context = ParserContext::ColumnMetadata(self.current_metadata.clone().unwrap());
-        let mut row_count: usize = 0;
 
-        loop {
-            let result = self
-                .transport
-                .receive_row_into_raw(
-                    &parser_context,
-                    writer,
-                )
-                .await?;
+        let (row_count, result) = self
+            .transport
+            .read_rows_bulk(&parser_context, writer)
+            .await?;
 
-            match result {
-                RowReadResult::RowWritten => {
-                    writer.end_row();
-                    row_count += 1;
+        // Handle the terminating non-row token
+        match result {
+            RowReadResult::Token(token) => match token {
+                Tokens::DoneInProc(done) | Tokens::DoneProc(done) | Tokens::Done(done) => {
+                    let count = self.count_map.entry(done.cur_cmd).or_insert(0);
+                    *count = count.saturating_add(done.row_count);
+                    self.current_result_set_has_been_read_till_end = true;
+                    if !done.has_more() {
+                        self.execution_context.set_has_open_batch(false);
+                    }
                 }
-                RowReadResult::Token(token) => match token {
-                    Tokens::DoneInProc(done) | Tokens::DoneProc(done) | Tokens::Done(done) => {
-                        let count = self.count_map.entry(done.cur_cmd).or_insert(0);
-                        *count = count.saturating_add(done.row_count);
-                        self.current_result_set_has_been_read_till_end = true;
-                        if !done.has_more() {
-                            self.execution_context.set_has_open_batch(false);
-                        }
-                        return Ok(row_count);
-                    }
-                    Tokens::Order(_) | Tokens::EnvChange(_) => continue,
-                    Tokens::ReturnValue(rv) => {
-                        self.return_values.push(rv.into());
-                        continue;
-                    }
-                    Tokens::Error(error_token) => {
-                        return Err(crate::error::Error::SqlServerError {
-                            message: error_token.message.clone(),
-                            state: error_token.state,
-                            class: error_token.severity as i32,
-                            number: error_token.number,
-                            server_name: Some(error_token.server_name.clone()),
-                            proc_name: Some(error_token.proc_name.clone()),
-                            line_number: Some(error_token.line_number as i32),
-                        });
-                    }
-                    _ => {
-                        return Err(crate::error::Error::ProtocolError(format!(
-                            "Unexpected token while reading rows: {token:?}"
-                        )));
-                    }
-                },
-            }
+                Tokens::Order(_) | Tokens::EnvChange(_) => {}
+                Tokens::ReturnValue(rv) => {
+                    self.return_values.push(rv.into());
+                }
+                Tokens::Error(error_token) => {
+                    return Err(crate::error::Error::SqlServerError {
+                        message: error_token.message.clone(),
+                        state: error_token.state,
+                        class: error_token.severity as i32,
+                        number: error_token.number,
+                        server_name: Some(error_token.server_name.clone()),
+                        proc_name: Some(error_token.proc_name.clone()),
+                        line_number: Some(error_token.line_number as i32),
+                    });
+                }
+                _ => {
+                    return Err(crate::error::Error::ProtocolError(format!(
+                        "Unexpected token while reading rows: {token:?}"
+                    )));
+                }
+            },
+            RowReadResult::RowWritten => unreachable!("read_rows_bulk always returns Token"),
         }
+
+        Ok(row_count)
     }
 
     /// Gets the return values collected so far.

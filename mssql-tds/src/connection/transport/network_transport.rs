@@ -1474,6 +1474,49 @@ impl crate::connection::transport::tds_transport::TdsTransport for NetworkTransp
     ) -> TdsResult<RowReadResult> {
         self.receive_row_into_internal(context, writer).await
     }
+
+    async fn read_rows_bulk(
+        &mut self,
+        context: &ParserContext,
+        writer: &mut (dyn RowWriter + Send),
+    ) -> TdsResult<(usize, RowReadResult)> {
+        let columns = Self::extract_column_metadata(context)?;
+        let decoder = GenericDecoder::default();
+        let mut count = 0usize;
+
+        loop {
+            let token_type_byte = self.read_byte().await?;
+            let token_type: TokenType = token_type_byte.try_into()?;
+
+            match token_type {
+                TokenType::Row => {
+                    for (col, meta) in columns.iter().enumerate() {
+                        decoder.decode_into(self, meta, col, writer).await?;
+                    }
+                    writer.end_row();
+                    count += 1;
+                }
+                TokenType::NbcRow => {
+                    let bitmap_len = columns.len().div_ceil(8);
+                    let mut bitmap = vec![0u8; bitmap_len];
+                    self.read_bytes(&mut bitmap).await?;
+                    for (col, meta) in columns.iter().enumerate() {
+                        if bitmap[col / 8] & (1 << (col % 8)) != 0 {
+                            writer.write_null(col);
+                        } else {
+                            decoder.decode_into(self, meta, col, writer).await?;
+                        }
+                    }
+                    writer.end_row();
+                    count += 1;
+                }
+                _ => {
+                    let token = self.dispatch_token(token_type, context).await?;
+                    return Ok((count, RowReadResult::Token(token)));
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

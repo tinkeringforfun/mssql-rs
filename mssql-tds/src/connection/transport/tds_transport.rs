@@ -59,4 +59,25 @@ pub(crate) trait TdsTransport: TdsTokenStreamReader + Send + Sync + std::fmt::De
         context: &ParserContext,
         writer: &mut (dyn RowWriter + Send),
     ) -> TdsResult<RowReadResult>;
+
+    /// Read all rows in a tight loop, calling writer.end_row() after each.
+    /// Returns RowReadResult::Token for the first non-row token encountered.
+    /// Default impl delegates to receive_row_into_raw; transports may override
+    /// for tighter loops.
+    async fn read_rows_bulk(
+        &mut self,
+        context: &ParserContext,
+        writer: &mut (dyn RowWriter + Send),
+    ) -> TdsResult<(usize, RowReadResult)> {
+        let mut count = 0usize;
+        loop {
+            match self.receive_row_into_raw(context, writer).await? {
+                RowReadResult::RowWritten => {
+                    writer.end_row();
+                    count += 1;
+                }
+                RowReadResult::Token(tok) => return Ok((count, RowReadResult::Token(tok))),
+            }
+        }
+    }
 }
