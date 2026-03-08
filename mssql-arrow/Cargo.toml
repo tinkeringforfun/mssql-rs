@@ -20,6 +20,10 @@ uuid = "1.19.0"
 name = "arrow_tds_bench"
 harness = false
 
+[[bench]]
+name = "arrow_read_bench"
+harness = false
+
 [dev-dependencies]
 criterion = "0.5"
 dotenv = "0.15"

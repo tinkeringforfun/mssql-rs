@@ -1,6 +1,6 @@
 # mssql-arrow
 
-High-performance Arrow RecordBatch bulk copy for SQL Server via `mssql-tds`.
+High-performance Arrow RecordBatch I/O for SQL Server via `mssql-tds`.
 
 ## Crate Overview
 
@@ -77,3 +77,31 @@ cargo nextest run -p mssql-arrow --test bench_arrow_bulk_copy --run-ignored=only
 ```
 
 The test is marked `#[ignore]` so it won't run during normal `cargo btest`. You must explicitly opt in with `--run-ignored=only`.
+
+### 3. End-to-End Read Benchmark (requires live SQL Server)
+
+Measures query read throughput — TDS wire → Arrow RecordBatch — comparing direct RowWriter deserialization against the materialized ColumnValues path.
+
+| Path | Description |
+|------|-------------|
+| **A** — Direct (ArrowQueryReader) | TDS decoder writes typed values straight into Arrow column builders via the `RowWriter` trait — no intermediate enum, no per-row allocation |
+| **B** — Materialized | TDS decoder produces `Vec<ColumnValues>` per row (via `DefaultRowWriter`), then a second pass converts each value into Arrow builder appends |
+| **C** — Raw rows (no Arrow) | TDS decoder to `Vec<ColumnValues>` only, measuring pure TDS decode cost without Arrow conversion |
+
+Runs **100,000 rows × 10 iterations** per path.
+
+**Schema:** `INT, BIGINT, FLOAT, NVARCHAR(200), DECIMAL(18,2)`
+
+#### Run
+
+```bash
+cargo nextest run -p mssql-arrow --test bench_arrow_read --run-ignored=only --success-output immediate
+```
+
+### 4. Criterion Read Microbenchmark (no SQL Server required)
+
+Measures pure deserialization throughput — simulated TDS decode calls → Arrow RecordBatch — with no network I/O. Compares the direct RowWriter path against the materialized ColumnValues → Arrow conversion.
+
+```bash
+cargo bench -p mssql-arrow -- arrow_read
+```
