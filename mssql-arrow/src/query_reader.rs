@@ -34,142 +34,29 @@ const DAYS_1900_TO_UNIX: i32 = 25_567;
 const MICROS_PER_DAY: i64 = 86_400_000_000;
 const MICROS_PER_MINUTE: i64 = 60_000_000;
 
-// ── ColumnBuilder ────────────────────────────────────────────────────────
+// ── Column type tag ──────────────────────────────────────────────────────
 
-enum ColumnBuilder {
-    Boolean(BooleanBuilder),
-    UInt8(UInt8Builder),
-    Int16(Int16Builder),
-    Int32(Int32Builder),
-    Int64(Int64Builder),
-    Float32(Float32Builder),
-    Float64(Float64Builder),
-    Decimal128 {
-        builder: Decimal128Builder,
-        precision: u8,
-        scale: i8,
-    },
-    Utf8(StringBuilder),
-    Binary(BinaryBuilder),
-    Date32(Date32Builder),
-    Time64Microsecond(Time64MicrosecondBuilder),
-    TimestampMicrosecond(TimestampMicrosecondBuilder),
-    TimestampMicrosecondUtc(TimestampMicrosecondBuilder),
-    FixedSizeBinary16(FixedSizeBinaryBuilder),
-}
-
-impl ColumnBuilder {
-    fn append_null(&mut self) {
-        match self {
-            Self::Boolean(b) => b.append_null(),
-            Self::UInt8(b) => b.append_null(),
-            Self::Int16(b) => b.append_null(),
-            Self::Int32(b) => b.append_null(),
-            Self::Int64(b) => b.append_null(),
-            Self::Float32(b) => b.append_null(),
-            Self::Float64(b) => b.append_null(),
-            Self::Decimal128 { builder, .. } => builder.append_null(),
-            Self::Utf8(b) => b.append_null(),
-            Self::Binary(b) => b.append_null(),
-            Self::Date32(b) => b.append_null(),
-            Self::Time64Microsecond(b) => b.append_null(),
-            Self::TimestampMicrosecond(b) => b.append_null(),
-            Self::TimestampMicrosecondUtc(b) => b.append_null(),
-            Self::FixedSizeBinary16(b) => b.append_null(),
-        }
-    }
-
-    fn into_field_and_array(self, name: &str, nullable: bool) -> (Field, ArrayRef) {
-        match self {
-            Self::Boolean(mut b) => {
-                let arr = b.finish();
-                (Field::new(name, DataType::Boolean, nullable), Arc::new(arr))
-            }
-            Self::UInt8(mut b) => {
-                let arr = b.finish();
-                (Field::new(name, DataType::UInt8, nullable), Arc::new(arr))
-            }
-            Self::Int16(mut b) => {
-                let arr = b.finish();
-                (Field::new(name, DataType::Int16, nullable), Arc::new(arr))
-            }
-            Self::Int32(mut b) => {
-                let arr = b.finish();
-                (Field::new(name, DataType::Int32, nullable), Arc::new(arr))
-            }
-            Self::Int64(mut b) => {
-                let arr = b.finish();
-                (Field::new(name, DataType::Int64, nullable), Arc::new(arr))
-            }
-            Self::Float32(mut b) => {
-                let arr = b.finish();
-                (Field::new(name, DataType::Float32, nullable), Arc::new(arr))
-            }
-            Self::Float64(mut b) => {
-                let arr = b.finish();
-                (Field::new(name, DataType::Float64, nullable), Arc::new(arr))
-            }
-            Self::Decimal128 {
-                mut builder,
-                precision,
-                scale,
-            } => {
-                let arr = builder.finish();
-                (
-                    Field::new(name, DataType::Decimal128(precision, scale), nullable),
-                    Arc::new(arr),
-                )
-            }
-            Self::Utf8(mut b) => {
-                let arr = b.finish();
-                (Field::new(name, DataType::Utf8, nullable), Arc::new(arr))
-            }
-            Self::Binary(mut b) => {
-                let arr = b.finish();
-                (Field::new(name, DataType::Binary, nullable), Arc::new(arr))
-            }
-            Self::Date32(mut b) => {
-                let arr = b.finish();
-                (Field::new(name, DataType::Date32, nullable), Arc::new(arr))
-            }
-            Self::Time64Microsecond(mut b) => {
-                let arr = b.finish();
-                (
-                    Field::new(name, DataType::Time64(TimeUnit::Microsecond), nullable),
-                    Arc::new(arr),
-                )
-            }
-            Self::TimestampMicrosecond(mut b) => {
-                let arr = b.finish();
-                (
-                    Field::new(
-                        name,
-                        DataType::Timestamp(TimeUnit::Microsecond, None),
-                        nullable,
-                    ),
-                    Arc::new(arr),
-                )
-            }
-            Self::TimestampMicrosecondUtc(mut b) => {
-                let arr = b.finish();
-                (
-                    Field::new(
-                        name,
-                        DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
-                        nullable,
-                    ),
-                    Arc::new(arr),
-                )
-            }
-            Self::FixedSizeBinary16(mut b) => {
-                let arr = b.finish();
-                (
-                    Field::new(name, DataType::FixedSizeBinary(16), nullable),
-                    Arc::new(arr),
-                )
-            }
-        }
-    }
+/// Lightweight tag identifying the Arrow builder type for a column.
+/// Used for `write_null` dispatch and `finish()` — the hot-path typed
+/// write methods (write_i32, write_f64, etc.) bypass this entirely.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+enum ColType {
+    Boolean,
+    UInt8,
+    Int16,
+    Int32,
+    Int64,
+    Float32,
+    Float64,
+    Decimal128,
+    Utf8,
+    Binary,
+    Date32,
+    Time64Microsecond,
+    TimestampMicrosecond,
+    TimestampMicrosecondUtc,
+    FixedSizeBinary16,
 }
 
 // ── Helper functions ─────────────────────────────────────────────────────
@@ -190,7 +77,6 @@ fn tds_date_to_arrow_date32(date: &SqlDate) -> i32 {
 }
 
 fn sql_time_to_micros(time: &SqlTime) -> i64 {
-    // time_nanoseconds is the time value in nanoseconds; convert to microseconds
     (time.time_nanoseconds / 1_000) as i64
 }
 
@@ -202,7 +88,6 @@ fn datetime2_to_epoch_micros(dt: &SqlDateTime2) -> i64 {
 
 fn datetime_to_epoch_micros(dt: &SqlDateTime) -> i64 {
     let days_since_epoch = dt.days as i64 - DAYS_1900_TO_UNIX as i64;
-    // Each tick = 1/300 second = 3333.333... microseconds
     let time_micros = (dt.time as i64 * 10_000) / 3;
     days_since_epoch * MICROS_PER_DAY + time_micros
 }
@@ -214,44 +99,305 @@ fn smalldatetime_to_epoch_micros(dt: &SqlSmallDateTime) -> i64 {
 }
 
 fn sql_money_to_f64(money: &SqlMoney) -> f64 {
-    // TDS MONEY: mixed-endian — lsb_part is low 4 bytes, msb_part is high 4 bytes
     let lsb_in_i64 = (money.lsb_part as i64) & 0x00000000FFFFFFFF;
     let combined = lsb_in_i64 | ((money.msb_part as i64) << 32);
     combined as f64 / 10_000.0
 }
 
-// ── ArrowQueryReader ─────────────────────────────────────────────────────
+// ── ArrowQueryReader — Monomorphic Dispatch ──────────────────────────────
+//
+// Instead of a single `Vec<ColumnBuilder>` (a 15-variant enum matched on
+// every cell write), builders are stored in per-type Vecs. A dispatch
+// table maps each column index to (ColType, slot) where slot is the
+// index into the type-specific Vec. The hot-path `write_*` methods index
+// directly into the correct typed Vec — no enum discriminant check, no
+// pattern matching, just an array index + append.
+
+/// Per-column dispatch entry: type tag + index into the type-specific builder Vec.
+#[derive(Clone, Copy)]
+struct ColSlot {
+    col_type: ColType,
+    slot: usize,
+}
 
 /// Accumulates SQL Server query results into Arrow RecordBatch format.
+///
+/// Uses monomorphic dispatch: each column's builder lives in a homogeneous
+/// `Vec<Builder>`, indexed by a pre-computed slot. The typed `write_*`
+/// methods go straight to the right builder with zero enum matching.
 pub struct ArrowQueryReader {
-    columns: Vec<ColumnBuilder>,
+    // Per-column dispatch table
+    dispatch: Vec<ColSlot>,
     names: Vec<String>,
     nullable: Vec<bool>,
+
+    // Per-type builder storage (each indexed by ColSlot.slot)
+    bool_builders: Vec<BooleanBuilder>,
+    u8_builders: Vec<UInt8Builder>,
+    i16_builders: Vec<Int16Builder>,
+    i32_builders: Vec<Int32Builder>,
+    i64_builders: Vec<Int64Builder>,
+    f32_builders: Vec<Float32Builder>,
+    f64_builders: Vec<Float64Builder>,
+    dec_builders: Vec<(Decimal128Builder, u8, i8)>, // (builder, precision, scale)
+    str_builders: Vec<StringBuilder>,
+    bin_builders: Vec<BinaryBuilder>,
+    date_builders: Vec<Date32Builder>,
+    time_builders: Vec<Time64MicrosecondBuilder>,
+    ts_builders: Vec<TimestampMicrosecondBuilder>,
+    ts_utc_builders: Vec<TimestampMicrosecondBuilder>,
+    uuid_builders: Vec<FixedSizeBinaryBuilder>,
+
     row_count: usize,
     batch_size: usize,
+    /// Reusable buffer for UTF-16 → UTF-8 string decoding.
+    string_buf: String,
 }
 
 impl ArrowQueryReader {
     /// Create a reader initialized from column metadata.
-    /// Column builders are typed upfront — no lazy discovery.
     pub fn from_metadata(metadata: &[ColumnMetadata], batch_size: usize) -> TdsResult<Self> {
-        let mut columns = Vec::with_capacity(metadata.len());
-        let mut names = Vec::with_capacity(metadata.len());
-        let mut nullable = Vec::with_capacity(metadata.len());
-
-        for col in metadata {
-            names.push(col.column_name.clone());
-            nullable.push(col.is_nullable());
-            columns.push(column_metadata_to_builder(col)?);
-        }
-
-        Ok(Self {
-            columns,
-            names,
-            nullable,
+        let mut reader = Self {
+            dispatch: Vec::with_capacity(metadata.len()),
+            names: Vec::with_capacity(metadata.len()),
+            nullable: Vec::with_capacity(metadata.len()),
+            bool_builders: Vec::new(),
+            u8_builders: Vec::new(),
+            i16_builders: Vec::new(),
+            i32_builders: Vec::new(),
+            i64_builders: Vec::new(),
+            f32_builders: Vec::new(),
+            f64_builders: Vec::new(),
+            dec_builders: Vec::new(),
+            str_builders: Vec::new(),
+            bin_builders: Vec::new(),
+            date_builders: Vec::new(),
+            time_builders: Vec::new(),
+            ts_builders: Vec::new(),
+            ts_utc_builders: Vec::new(),
+            uuid_builders: Vec::new(),
             row_count: 0,
             batch_size,
-        })
+            string_buf: String::with_capacity(256),
+        };
+
+        for col in metadata {
+            reader.names.push(col.column_name.clone());
+            reader.nullable.push(col.is_nullable());
+            let slot = reader.add_builder(col, batch_size)?;
+            reader.dispatch.push(slot);
+        }
+
+        Ok(reader)
+    }
+
+    /// Allocate a typed builder for the given column metadata and return its dispatch slot.
+    fn add_builder(
+        &mut self,
+        col: &ColumnMetadata,
+        capacity: usize,
+    ) -> TdsResult<ColSlot> {
+        use mssql_tds::datatypes::sqldatatypes::{TdsDataType, TypeInfoVariant};
+
+        let slot = match col.data_type {
+            TdsDataType::Bit | TdsDataType::BitN => {
+                let idx = self.bool_builders.len();
+                self.bool_builders
+                    .push(BooleanBuilder::with_capacity(capacity));
+                ColSlot { col_type: ColType::Boolean, slot: idx }
+            }
+
+            TdsDataType::Int1 => {
+                let idx = self.u8_builders.len();
+                self.u8_builders
+                    .push(UInt8Builder::with_capacity(capacity));
+                ColSlot { col_type: ColType::UInt8, slot: idx }
+            }
+
+            TdsDataType::Int2 => {
+                let idx = self.i16_builders.len();
+                self.i16_builders
+                    .push(Int16Builder::with_capacity(capacity));
+                ColSlot { col_type: ColType::Int16, slot: idx }
+            }
+
+            TdsDataType::Int4 => {
+                let idx = self.i32_builders.len();
+                self.i32_builders
+                    .push(Int32Builder::with_capacity(capacity));
+                ColSlot { col_type: ColType::Int32, slot: idx }
+            }
+
+            TdsDataType::Int8 => {
+                let idx = self.i64_builders.len();
+                self.i64_builders
+                    .push(Int64Builder::with_capacity(capacity));
+                ColSlot { col_type: ColType::Int64, slot: idx }
+            }
+
+            TdsDataType::IntN => match col.type_info.length {
+                1 => {
+                    let idx = self.u8_builders.len();
+                    self.u8_builders
+                        .push(UInt8Builder::with_capacity(capacity));
+                    ColSlot { col_type: ColType::UInt8, slot: idx }
+                }
+                2 => {
+                    let idx = self.i16_builders.len();
+                    self.i16_builders
+                        .push(Int16Builder::with_capacity(capacity));
+                    ColSlot { col_type: ColType::Int16, slot: idx }
+                }
+                4 => {
+                    let idx = self.i32_builders.len();
+                    self.i32_builders
+                        .push(Int32Builder::with_capacity(capacity));
+                    ColSlot { col_type: ColType::Int32, slot: idx }
+                }
+                _ => {
+                    let idx = self.i64_builders.len();
+                    self.i64_builders
+                        .push(Int64Builder::with_capacity(capacity));
+                    ColSlot { col_type: ColType::Int64, slot: idx }
+                }
+            },
+
+            TdsDataType::Flt4 => {
+                let idx = self.f32_builders.len();
+                self.f32_builders
+                    .push(Float32Builder::with_capacity(capacity));
+                ColSlot { col_type: ColType::Float32, slot: idx }
+            }
+
+            TdsDataType::Flt8 => {
+                let idx = self.f64_builders.len();
+                self.f64_builders
+                    .push(Float64Builder::with_capacity(capacity));
+                ColSlot { col_type: ColType::Float64, slot: idx }
+            }
+
+            TdsDataType::FltN => match col.type_info.length {
+                4 => {
+                    let idx = self.f32_builders.len();
+                    self.f32_builders
+                        .push(Float32Builder::with_capacity(capacity));
+                    ColSlot { col_type: ColType::Float32, slot: idx }
+                }
+                _ => {
+                    let idx = self.f64_builders.len();
+                    self.f64_builders
+                        .push(Float64Builder::with_capacity(capacity));
+                    ColSlot { col_type: ColType::Float64, slot: idx }
+                }
+            },
+
+            TdsDataType::DecimalN
+            | TdsDataType::NumericN
+            | TdsDataType::Decimal
+            | TdsDataType::Numeric => {
+                let (precision, scale) = match col.type_info.type_info_variant {
+                    TypeInfoVariant::VarLenPrecisionScale(_, _, p, s) => (p, s as i8),
+                    _ => (38, 0),
+                };
+                let idx = self.dec_builders.len();
+                self.dec_builders.push((
+                    Decimal128Builder::with_capacity(capacity)
+                        .with_precision_and_scale(precision, scale)
+                        .map_err(ArrowError::ArrowError)?,
+                    precision,
+                    scale,
+                ));
+                ColSlot { col_type: ColType::Decimal128, slot: idx }
+            }
+
+            TdsDataType::Money | TdsDataType::Money4 | TdsDataType::MoneyN => {
+                let idx = self.f64_builders.len();
+                self.f64_builders
+                    .push(Float64Builder::with_capacity(capacity));
+                ColSlot { col_type: ColType::Float64, slot: idx }
+            }
+
+            TdsDataType::DateN => {
+                let idx = self.date_builders.len();
+                self.date_builders
+                    .push(Date32Builder::with_capacity(capacity));
+                ColSlot { col_type: ColType::Date32, slot: idx }
+            }
+
+            TdsDataType::TimeN => {
+                let idx = self.time_builders.len();
+                self.time_builders
+                    .push(Time64MicrosecondBuilder::with_capacity(capacity));
+                ColSlot { col_type: ColType::Time64Microsecond, slot: idx }
+            }
+
+            TdsDataType::DateTime2N => {
+                let idx = self.ts_builders.len();
+                self.ts_builders
+                    .push(TimestampMicrosecondBuilder::with_capacity(capacity));
+                ColSlot { col_type: ColType::TimestampMicrosecond, slot: idx }
+            }
+
+            TdsDataType::DateTimeOffsetN => {
+                let idx = self.ts_utc_builders.len();
+                self.ts_utc_builders
+                    .push(TimestampMicrosecondBuilder::with_capacity(capacity));
+                ColSlot { col_type: ColType::TimestampMicrosecondUtc, slot: idx }
+            }
+
+            TdsDataType::DateTime | TdsDataType::DateTim4 | TdsDataType::DateTimeN => {
+                let idx = self.ts_builders.len();
+                self.ts_builders
+                    .push(TimestampMicrosecondBuilder::with_capacity(capacity));
+                ColSlot { col_type: ColType::TimestampMicrosecond, slot: idx }
+            }
+
+            TdsDataType::NVarChar
+            | TdsDataType::NChar
+            | TdsDataType::BigVarChar
+            | TdsDataType::BigChar
+            | TdsDataType::Text
+            | TdsDataType::NText
+            | TdsDataType::VarChar
+            | TdsDataType::Char
+            | TdsDataType::Xml
+            | TdsDataType::Json
+            | TdsDataType::Vector => {
+                let avg = col.type_info.length.min(200) as usize;
+                let idx = self.str_builders.len();
+                self.str_builders
+                    .push(StringBuilder::with_capacity(capacity, capacity * avg));
+                ColSlot { col_type: ColType::Utf8, slot: idx }
+            }
+
+            TdsDataType::BigVarBinary
+            | TdsDataType::BigBinary
+            | TdsDataType::VarBinary
+            | TdsDataType::Binary
+            | TdsDataType::Image => {
+                let avg = col.type_info.length.min(256) as usize;
+                let idx = self.bin_builders.len();
+                self.bin_builders
+                    .push(BinaryBuilder::with_capacity(capacity, capacity * avg));
+                ColSlot { col_type: ColType::Binary, slot: idx }
+            }
+
+            TdsDataType::Guid => {
+                let idx = self.uuid_builders.len();
+                self.uuid_builders
+                    .push(FixedSizeBinaryBuilder::new(16));
+                ColSlot { col_type: ColType::FixedSizeBinary16, slot: idx }
+            }
+
+            _ => {
+                return Err(mssql_tds::error::Error::TypeConversionError(format!(
+                    "unsupported TDS type {:?} for Arrow conversion",
+                    col.data_type
+                )));
+            }
+        };
+
+        Ok(slot)
     }
 
     pub fn row_count(&self) -> usize {
@@ -268,12 +414,99 @@ impl ArrowQueryReader {
             return Ok(None);
         }
 
-        let columns = std::mem::take(&mut self.columns);
-        let mut fields = Vec::with_capacity(columns.len());
-        let mut arrays = Vec::with_capacity(columns.len());
+        let mut fields = Vec::with_capacity(self.dispatch.len());
+        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(self.dispatch.len());
 
-        for (i, builder) in columns.into_iter().enumerate() {
-            let (field, array) = builder.into_field_and_array(&self.names[i], self.nullable[i]);
+        for (i, slot) in self.dispatch.iter().enumerate() {
+            let name = &self.names[i];
+            let nullable = self.nullable[i];
+            let (field, array) = match slot.col_type {
+                ColType::Boolean => {
+                    let arr = self.bool_builders[slot.slot].finish();
+                    (Field::new(name, DataType::Boolean, nullable), Arc::new(arr) as ArrayRef)
+                }
+                ColType::UInt8 => {
+                    let arr = self.u8_builders[slot.slot].finish();
+                    (Field::new(name, DataType::UInt8, nullable), Arc::new(arr) as ArrayRef)
+                }
+                ColType::Int16 => {
+                    let arr = self.i16_builders[slot.slot].finish();
+                    (Field::new(name, DataType::Int16, nullable), Arc::new(arr) as ArrayRef)
+                }
+                ColType::Int32 => {
+                    let arr = self.i32_builders[slot.slot].finish();
+                    (Field::new(name, DataType::Int32, nullable), Arc::new(arr) as ArrayRef)
+                }
+                ColType::Int64 => {
+                    let arr = self.i64_builders[slot.slot].finish();
+                    (Field::new(name, DataType::Int64, nullable), Arc::new(arr) as ArrayRef)
+                }
+                ColType::Float32 => {
+                    let arr = self.f32_builders[slot.slot].finish();
+                    (Field::new(name, DataType::Float32, nullable), Arc::new(arr) as ArrayRef)
+                }
+                ColType::Float64 => {
+                    let arr = self.f64_builders[slot.slot].finish();
+                    (Field::new(name, DataType::Float64, nullable), Arc::new(arr) as ArrayRef)
+                }
+                ColType::Decimal128 => {
+                    let (ref mut builder, precision, scale) =
+                        self.dec_builders[slot.slot];
+                    let arr = builder.finish();
+                    (
+                        Field::new(name, DataType::Decimal128(precision, scale), nullable),
+                        Arc::new(arr) as ArrayRef,
+                    )
+                }
+                ColType::Utf8 => {
+                    let arr = self.str_builders[slot.slot].finish();
+                    (Field::new(name, DataType::Utf8, nullable), Arc::new(arr) as ArrayRef)
+                }
+                ColType::Binary => {
+                    let arr = self.bin_builders[slot.slot].finish();
+                    (Field::new(name, DataType::Binary, nullable), Arc::new(arr) as ArrayRef)
+                }
+                ColType::Date32 => {
+                    let arr = self.date_builders[slot.slot].finish();
+                    (Field::new(name, DataType::Date32, nullable), Arc::new(arr) as ArrayRef)
+                }
+                ColType::Time64Microsecond => {
+                    let arr = self.time_builders[slot.slot].finish();
+                    (
+                        Field::new(name, DataType::Time64(TimeUnit::Microsecond), nullable),
+                        Arc::new(arr) as ArrayRef,
+                    )
+                }
+                ColType::TimestampMicrosecond => {
+                    let arr = self.ts_builders[slot.slot].finish();
+                    (
+                        Field::new(
+                            name,
+                            DataType::Timestamp(TimeUnit::Microsecond, None),
+                            nullable,
+                        ),
+                        Arc::new(arr) as ArrayRef,
+                    )
+                }
+                ColType::TimestampMicrosecondUtc => {
+                    let arr = self.ts_utc_builders[slot.slot].finish();
+                    (
+                        Field::new(
+                            name,
+                            DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
+                            nullable,
+                        ),
+                        Arc::new(arr) as ArrayRef,
+                    )
+                }
+                ColType::FixedSizeBinary16 => {
+                    let arr = self.uuid_builders[slot.slot].finish();
+                    (
+                        Field::new(name, DataType::FixedSizeBinary(16), nullable),
+                        Arc::new(arr) as ArrayRef,
+                    )
+                }
+            };
             fields.push(field);
             arrays.push(array);
         }
@@ -281,11 +514,8 @@ impl ArrowQueryReader {
         let schema = Arc::new(Schema::new(fields));
         let batch = RecordBatch::try_new(schema, arrays).map_err(ArrowError::ArrowError)?;
 
-        // Reset for next batch — re-create builders with same metadata
-        // Since we consumed the builders, we need to create fresh ones.
-        // The caller should create a new reader or we reinitialize.
         self.row_count = 0;
-        self.columns = Vec::new(); // Will be empty until reinit
+        // Builders are consumed by finish() — caller should create a new reader for next batch.
 
         Ok(Some(batch))
     }
@@ -308,7 +538,6 @@ impl ArrowQueryReader {
                 if let Some(batch) = reader.finish()? {
                     batches.push(batch);
                 }
-                // Re-create builders for next batch
                 reader = Self::from_metadata(&metadata, batch_size)?;
             }
         }
@@ -322,256 +551,189 @@ impl ArrowQueryReader {
 
         Ok(batches)
     }
+
+    /// Append null to the correct typed builder for the given column.
+    #[inline]
+    fn append_null_to_slot(&mut self, slot: &ColSlot) {
+        match slot.col_type {
+            ColType::Boolean => self.bool_builders[slot.slot].append_null(),
+            ColType::UInt8 => self.u8_builders[slot.slot].append_null(),
+            ColType::Int16 => self.i16_builders[slot.slot].append_null(),
+            ColType::Int32 => self.i32_builders[slot.slot].append_null(),
+            ColType::Int64 => self.i64_builders[slot.slot].append_null(),
+            ColType::Float32 => self.f32_builders[slot.slot].append_null(),
+            ColType::Float64 => self.f64_builders[slot.slot].append_null(),
+            ColType::Decimal128 => self.dec_builders[slot.slot].0.append_null(),
+            ColType::Utf8 => self.str_builders[slot.slot].append_null(),
+            ColType::Binary => self.bin_builders[slot.slot].append_null(),
+            ColType::Date32 => self.date_builders[slot.slot].append_null(),
+            ColType::Time64Microsecond => self.time_builders[slot.slot].append_null(),
+            ColType::TimestampMicrosecond => self.ts_builders[slot.slot].append_null(),
+            ColType::TimestampMicrosecondUtc => self.ts_utc_builders[slot.slot].append_null(),
+            ColType::FixedSizeBinary16 => self.uuid_builders[slot.slot].append_null(),
+        }
+    }
 }
 
-// ── ColumnMetadata → ColumnBuilder ───────────────────────────────────────
-
-fn column_metadata_to_builder(col: &ColumnMetadata) -> TdsResult<ColumnBuilder> {
-    use mssql_tds::datatypes::sqldatatypes::{TdsDataType, TypeInfoVariant};
-
-    let builder = match col.data_type {
-        TdsDataType::Bit | TdsDataType::BitN => ColumnBuilder::Boolean(BooleanBuilder::new()),
-
-        TdsDataType::Int1 => ColumnBuilder::UInt8(UInt8Builder::new()),
-
-        TdsDataType::Int2 => ColumnBuilder::Int16(Int16Builder::new()),
-
-        TdsDataType::Int4 => ColumnBuilder::Int32(Int32Builder::new()),
-
-        TdsDataType::Int8 => ColumnBuilder::Int64(Int64Builder::new()),
-
-        TdsDataType::IntN => match col.type_info.length {
-            1 => ColumnBuilder::UInt8(UInt8Builder::new()),
-            2 => ColumnBuilder::Int16(Int16Builder::new()),
-            4 => ColumnBuilder::Int32(Int32Builder::new()),
-            8 => ColumnBuilder::Int64(Int64Builder::new()),
-            _ => ColumnBuilder::Int64(Int64Builder::new()),
-        },
-
-        TdsDataType::Flt4 => ColumnBuilder::Float32(Float32Builder::new()),
-
-        TdsDataType::Flt8 => ColumnBuilder::Float64(Float64Builder::new()),
-
-        TdsDataType::FltN => match col.type_info.length {
-            4 => ColumnBuilder::Float32(Float32Builder::new()),
-            _ => ColumnBuilder::Float64(Float64Builder::new()),
-        },
-
-        TdsDataType::DecimalN
-        | TdsDataType::NumericN
-        | TdsDataType::Decimal
-        | TdsDataType::Numeric => {
-            let (precision, scale) = match col.type_info.type_info_variant {
-                TypeInfoVariant::VarLenPrecisionScale(_, _, p, s) => (p, s as i8),
-                _ => (38, 0),
-            };
-            ColumnBuilder::Decimal128 {
-                builder: Decimal128Builder::new()
-                    .with_precision_and_scale(precision, scale)
-                    .map_err(ArrowError::ArrowError)?,
-                precision,
-                scale,
-            }
-        }
-
-        TdsDataType::Money | TdsDataType::Money4 | TdsDataType::MoneyN => {
-            ColumnBuilder::Float64(Float64Builder::new())
-        }
-
-        TdsDataType::DateN => ColumnBuilder::Date32(Date32Builder::new()),
-
-        TdsDataType::TimeN => ColumnBuilder::Time64Microsecond(Time64MicrosecondBuilder::new()),
-
-        TdsDataType::DateTime2N => {
-            ColumnBuilder::TimestampMicrosecond(TimestampMicrosecondBuilder::new())
-        }
-
-        TdsDataType::DateTimeOffsetN => {
-            ColumnBuilder::TimestampMicrosecondUtc(TimestampMicrosecondBuilder::new())
-        }
-
-        TdsDataType::DateTime | TdsDataType::DateTim4 | TdsDataType::DateTimeN => {
-            ColumnBuilder::TimestampMicrosecond(TimestampMicrosecondBuilder::new())
-        }
-
-        TdsDataType::NVarChar
-        | TdsDataType::NChar
-        | TdsDataType::BigVarChar
-        | TdsDataType::BigChar
-        | TdsDataType::Text
-        | TdsDataType::NText
-        | TdsDataType::VarChar
-        | TdsDataType::Char
-        | TdsDataType::Xml
-        | TdsDataType::Json
-        | TdsDataType::Vector => ColumnBuilder::Utf8(StringBuilder::new()),
-
-        TdsDataType::BigVarBinary
-        | TdsDataType::BigBinary
-        | TdsDataType::VarBinary
-        | TdsDataType::Binary
-        | TdsDataType::Image => ColumnBuilder::Binary(BinaryBuilder::new()),
-
-        TdsDataType::Guid => ColumnBuilder::FixedSizeBinary16(FixedSizeBinaryBuilder::new(16)),
-
-        _ => {
-            return Err(mssql_tds::error::Error::TypeConversionError(format!(
-                "unsupported TDS type {:?} for Arrow conversion",
-                col.data_type
-            )));
-        }
-    };
-
-    Ok(builder)
-}
-
-// ── RowWriter implementation ─────────────────────────────────────────────
+// ── RowWriter — Monomorphic dispatch ─────────────────────────────────────
+//
+// Each typed write method indexes directly into the correct per-type Vec.
+// No enum discriminant check, no pattern matching — just array[slot].append.
 
 impl RowWriter for ArrowQueryReader {
+    #[inline]
     fn write_null(&mut self, col: usize) {
-        self.columns[col].append_null();
+        let slot = self.dispatch[col];
+        self.append_null_to_slot(&slot);
     }
 
+    #[inline]
     fn write_bool(&mut self, col: usize, val: bool) {
-        if let ColumnBuilder::Boolean(b) = &mut self.columns[col] {
-            b.append_value(val);
-        }
+        self.bool_builders[self.dispatch[col].slot].append_value(val);
     }
 
+    #[inline]
     fn write_u8(&mut self, col: usize, val: u8) {
-        if let ColumnBuilder::UInt8(b) = &mut self.columns[col] {
-            b.append_value(val);
-        }
+        self.u8_builders[self.dispatch[col].slot].append_value(val);
     }
 
+    #[inline]
     fn write_i16(&mut self, col: usize, val: i16) {
-        if let ColumnBuilder::Int16(b) = &mut self.columns[col] {
-            b.append_value(val);
-        }
+        self.i16_builders[self.dispatch[col].slot].append_value(val);
     }
 
+    #[inline]
     fn write_i32(&mut self, col: usize, val: i32) {
-        if let ColumnBuilder::Int32(b) = &mut self.columns[col] {
-            b.append_value(val);
-        }
+        self.i32_builders[self.dispatch[col].slot].append_value(val);
     }
 
+    #[inline]
     fn write_i64(&mut self, col: usize, val: i64) {
-        if let ColumnBuilder::Int64(b) = &mut self.columns[col] {
-            b.append_value(val);
-        }
+        self.i64_builders[self.dispatch[col].slot].append_value(val);
     }
 
+    #[inline]
     fn write_f32(&mut self, col: usize, val: f32) {
-        if let ColumnBuilder::Float32(b) = &mut self.columns[col] {
-            b.append_value(val);
-        }
+        self.f32_builders[self.dispatch[col].slot].append_value(val);
     }
 
+    #[inline]
     fn write_f64(&mut self, col: usize, val: f64) {
-        if let ColumnBuilder::Float64(b) = &mut self.columns[col] {
-            b.append_value(val);
-        }
+        self.f64_builders[self.dispatch[col].slot].append_value(val);
     }
 
+    #[inline]
     fn write_string(&mut self, col: usize, val: SqlString) {
-        if let ColumnBuilder::Utf8(b) = &mut self.columns[col] {
+        let b = &mut self.str_builders[self.dispatch[col].slot];
+        if val.is_utf16() {
+            self.string_buf.clear();
+            let bytes = &val.bytes;
+            let utf16_iter = bytes
+                .chunks_exact(2)
+                .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]));
+            for c in char::decode_utf16(utf16_iter) {
+                self.string_buf
+                    .push(c.unwrap_or(char::REPLACEMENT_CHARACTER));
+            }
+            b.append_value(&self.string_buf);
+        } else {
             b.append_value(val.to_string());
         }
     }
 
+    #[inline]
     fn write_bytes(&mut self, col: usize, val: Vec<u8>) {
-        if let ColumnBuilder::Binary(b) = &mut self.columns[col] {
-            b.append_value(&val);
-        }
+        self.bin_builders[self.dispatch[col].slot].append_value(&val);
     }
 
+    #[inline]
     fn write_decimal(&mut self, col: usize, val: DecimalParts) {
-        if let ColumnBuilder::Decimal128 { builder, .. } = &mut self.columns[col] {
-            builder.append_value(decimal_parts_to_i128(&val));
-        }
+        self.dec_builders[self.dispatch[col].slot]
+            .0
+            .append_value(decimal_parts_to_i128(&val));
     }
 
+    #[inline]
     fn write_numeric(&mut self, col: usize, val: DecimalParts) {
-        if let ColumnBuilder::Decimal128 { builder, .. } = &mut self.columns[col] {
-            builder.append_value(decimal_parts_to_i128(&val));
-        }
+        self.dec_builders[self.dispatch[col].slot]
+            .0
+            .append_value(decimal_parts_to_i128(&val));
     }
 
+    #[inline]
     fn write_date(&mut self, col: usize, val: SqlDate) {
-        if let ColumnBuilder::Date32(b) = &mut self.columns[col] {
-            b.append_value(tds_date_to_arrow_date32(&val));
-        }
+        self.date_builders[self.dispatch[col].slot]
+            .append_value(tds_date_to_arrow_date32(&val));
     }
 
+    #[inline]
     fn write_time(&mut self, col: usize, val: SqlTime) {
-        if let ColumnBuilder::Time64Microsecond(b) = &mut self.columns[col] {
-            b.append_value(sql_time_to_micros(&val));
-        }
+        self.time_builders[self.dispatch[col].slot]
+            .append_value(sql_time_to_micros(&val));
     }
 
+    #[inline]
     fn write_datetime(&mut self, col: usize, val: SqlDateTime) {
-        if let ColumnBuilder::TimestampMicrosecond(b) = &mut self.columns[col] {
-            b.append_value(datetime_to_epoch_micros(&val));
-        }
+        self.ts_builders[self.dispatch[col].slot]
+            .append_value(datetime_to_epoch_micros(&val));
     }
 
+    #[inline]
     fn write_smalldatetime(&mut self, col: usize, val: SqlSmallDateTime) {
-        if let ColumnBuilder::TimestampMicrosecond(b) = &mut self.columns[col] {
-            b.append_value(smalldatetime_to_epoch_micros(&val));
-        }
+        self.ts_builders[self.dispatch[col].slot]
+            .append_value(smalldatetime_to_epoch_micros(&val));
     }
 
+    #[inline]
     fn write_datetime2(&mut self, col: usize, val: SqlDateTime2) {
-        if let ColumnBuilder::TimestampMicrosecond(b) = &mut self.columns[col] {
-            b.append_value(datetime2_to_epoch_micros(&val));
-        }
+        self.ts_builders[self.dispatch[col].slot]
+            .append_value(datetime2_to_epoch_micros(&val));
     }
 
+    #[inline]
     fn write_datetimeoffset(&mut self, col: usize, val: SqlDateTimeOffset) {
-        if let ColumnBuilder::TimestampMicrosecondUtc(b) = &mut self.columns[col] {
-            let local_micros = datetime2_to_epoch_micros(&val.datetime2);
-            let offset_micros = val.offset as i64 * MICROS_PER_MINUTE;
-            b.append_value(local_micros - offset_micros);
-        }
+        let local_micros = datetime2_to_epoch_micros(&val.datetime2);
+        let offset_micros = val.offset as i64 * MICROS_PER_MINUTE;
+        self.ts_utc_builders[self.dispatch[col].slot]
+            .append_value(local_micros - offset_micros);
     }
 
+    #[inline]
     fn write_money(&mut self, col: usize, val: SqlMoney) {
-        if let ColumnBuilder::Float64(b) = &mut self.columns[col] {
-            b.append_value(sql_money_to_f64(&val));
-        }
+        self.f64_builders[self.dispatch[col].slot]
+            .append_value(sql_money_to_f64(&val));
     }
 
+    #[inline]
     fn write_smallmoney(&mut self, col: usize, val: SqlSmallMoney) {
-        if let ColumnBuilder::Float64(b) = &mut self.columns[col] {
-            b.append_value(val.int_val as f64 / 10_000.0);
-        }
+        self.f64_builders[self.dispatch[col].slot]
+            .append_value(val.int_val as f64 / 10_000.0);
     }
 
+    #[inline]
     fn write_uuid(&mut self, col: usize, val: Uuid) {
-        if let ColumnBuilder::FixedSizeBinary16(b) = &mut self.columns[col] {
-            let _ = b.append_value(val.as_bytes());
-        }
+        let _ = self.uuid_builders[self.dispatch[col].slot].append_value(val.as_bytes());
     }
 
+    #[inline]
     fn write_xml(&mut self, col: usize, val: SqlXml) {
-        if let ColumnBuilder::Utf8(b) = &mut self.columns[col] {
-            b.append_value(val.as_string());
-        }
+        self.str_builders[self.dispatch[col].slot]
+            .append_value(val.as_string());
     }
 
+    #[inline]
     fn write_json(&mut self, col: usize, val: SqlJson) {
-        if let ColumnBuilder::Utf8(b) = &mut self.columns[col] {
-            b.append_value(String::from_utf8_lossy(&val.bytes));
-        }
+        self.str_builders[self.dispatch[col].slot]
+            .append_value(String::from_utf8_lossy(&val.bytes));
     }
 
+    #[inline]
     fn write_vector(&mut self, col: usize, val: SqlVector) {
-        if let ColumnBuilder::Utf8(b) = &mut self.columns[col] {
-            b.append_value(format!("{val:?}"));
-        }
+        self.str_builders[self.dispatch[col].slot]
+            .append_value(format!("{val:?}"));
     }
 
+    #[inline]
     fn end_row(&mut self) {
         self.row_count += 1;
     }
@@ -652,7 +814,7 @@ mod tests {
         let reader = ArrowQueryReader::from_metadata(&metadata, 100).unwrap();
         assert_eq!(reader.names, vec!["tiny", "small", "regular", "big"]);
         assert_eq!(reader.nullable, vec![false, false, true, true]);
-        assert_eq!(reader.columns.len(), 4);
+        assert_eq!(reader.dispatch.len(), 4);
     }
 
     #[test]
@@ -686,7 +848,6 @@ mod tests {
 
         let mut reader = ArrowQueryReader::from_metadata(&metadata, 100).unwrap();
 
-        // Write one row with different int types
         reader.write_u8(0, 42);
         reader.write_i16(1, -100);
         reader.write_i32(2, 999);
@@ -870,7 +1031,6 @@ mod tests {
             is_positive: true,
             scale: 0,
             precision: 38,
-            // 2^32 + 1 = 4294967297
             int_parts: vec![1, 1],
         };
         assert_eq!(decimal_parts_to_i128(&parts), (1_i128 << 32) + 1);
@@ -878,16 +1038,12 @@ mod tests {
 
     #[test]
     fn tds_date_conversion() {
-        // 2000-01-01 is day 730119 since 0001-01-01
-        // Arrow epoch (1970-01-01) is day 719162 since 0001-01-01
-        // So days_since_epoch = 730119 - 719162 = 10957
         let date = SqlDate::create(730_119).unwrap();
         assert_eq!(tds_date_to_arrow_date32(&date), 10_957);
     }
 
     #[test]
     fn sql_time_to_micros_conversion() {
-        // 1 second = 1_000_000_000 nanoseconds → 1_000_000 microseconds
         let time = SqlTime {
             time_nanoseconds: 1_000_000_000,
             scale: 7,
@@ -897,10 +1053,9 @@ mod tests {
 
     #[test]
     fn datetime_conversion() {
-        // SqlDateTime: days from 1900-01-01, time in 1/300s ticks
         let dt = SqlDateTime {
-            days: DAYS_1900_TO_UNIX, // at Unix epoch
-            time: 300,               // 1 second
+            days: DAYS_1900_TO_UNIX,
+            time: 300,
         };
         let micros = datetime_to_epoch_micros(&dt);
         assert_eq!(micros, 1_000_000);
@@ -909,16 +1064,14 @@ mod tests {
     #[test]
     fn smalldatetime_conversion() {
         let dt = SqlSmallDateTime {
-            days: DAYS_1900_TO_UNIX as u16, // u16 required for SmallDateTime
-            time: 1,                        // 1 minute after midnight
+            days: DAYS_1900_TO_UNIX as u16,
+            time: 1,
         };
         assert_eq!(smalldatetime_to_epoch_micros(&dt), MICROS_PER_MINUTE);
     }
 
     #[test]
     fn money_conversion() {
-        // $1.00 = 10000 in MONEY wire format
-        // TDS: msb_part = 0 (high), lsb_part = 10000 (low)
         let m = SqlMoney {
             lsb_part: 10_000,
             msb_part: 0,
