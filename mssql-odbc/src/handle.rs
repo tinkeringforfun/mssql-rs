@@ -234,6 +234,19 @@ pub struct Statement {
     pub current_row: Vec<CellValue>,
     pub prefetch_buffer: VecDeque<Vec<CellValue>>,
     pub prefetch_done: Option<PrefetchTerminal>,
+    // Column bindings (for SQLBindCol / turbodbc batched fetch)
+    pub bound_cols: Vec<Option<BoundCol>>,
+    pub row_array_size: usize,
+    pub rows_fetched_ptr: *mut SQLULEN,
+    pub row_status_ptr: *mut SQLUSMALLINT,
+}
+
+/// A bound column descriptor
+pub struct BoundCol {
+    pub target_type: SQLSMALLINT,
+    pub target_value: SQLPOINTER,
+    pub buffer_length: SQLLEN,
+    pub str_len_or_ind: *mut SQLLEN,
 }
 
 /// Terminal state saved when prefetch batch hits end-of-stream
@@ -623,6 +636,10 @@ impl RowWriter for StringRowWriter {
             self.current_rows.push(row);
         }
     }
+
+    fn cancel_row(&mut self) {
+        self.current_row.clear();
+    }
 }
 
 // ── SingleRowWriter: for streaming fetch ────────────────────────────
@@ -657,8 +674,18 @@ impl<'a> RowWriter for SingleRowWriter<'a> {
         self.row.push(CellValue::F64(val));
     }
     fn write_string(&mut self, _col: usize, val: SqlString) {
-        self.row
-            .push(CellValue::String(val.to_utf8_string()));
+        // Keep UTF-16 directly to avoid double-conversion
+        match val.encoding_type() {
+            mssql_tds::datatypes::sql_string::EncodingType::Utf16 => {
+                let u16s: Vec<u16> = val.bytes.chunks_exact(2)
+                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                    .collect();
+                self.row.push(CellValue::Utf16(u16s));
+            }
+            _ => {
+                self.row.push(CellValue::String(val.to_utf8_string()));
+            }
+        }
     }
     fn write_bytes(&mut self, _col: usize, val: Vec<u8>) {
         self.row.push(CellValue::Bytes(val));
@@ -733,6 +760,90 @@ impl<'a> RowWriter for SingleRowWriter<'a> {
     }
     fn end_row(&mut self) {
         // no-op: row is taken by caller
+    }
+
+    fn cancel_row(&mut self) {
+        self.row.clear();
+    }
+}
+
+/// Bulk row writer that collects rows into a VecDeque for prefetch
+pub struct BulkRowWriter<'a> {
+    pub rows: &'a mut VecDeque<Vec<CellValue>>,
+    pub current_row: Vec<CellValue>,
+}
+
+impl<'a> RowWriter for BulkRowWriter<'a> {
+    fn write_null(&mut self, _col: usize) { self.current_row.push(CellValue::Null); }
+    fn write_bool(&mut self, _col: usize, val: bool) { self.current_row.push(CellValue::Bool(val)); }
+    fn write_u8(&mut self, _col: usize, val: u8) { self.current_row.push(CellValue::U8(val)); }
+    fn write_i16(&mut self, _col: usize, val: i16) { self.current_row.push(CellValue::I16(val)); }
+    fn write_i32(&mut self, _col: usize, val: i32) { self.current_row.push(CellValue::I32(val)); }
+    fn write_i64(&mut self, _col: usize, val: i64) { self.current_row.push(CellValue::I64(val)); }
+    fn write_f32(&mut self, _col: usize, val: f32) { self.current_row.push(CellValue::F32(val)); }
+    fn write_f64(&mut self, _col: usize, val: f64) { self.current_row.push(CellValue::F64(val)); }
+    fn write_string(&mut self, _col: usize, val: SqlString) {
+        match val.encoding_type() {
+            mssql_tds::datatypes::sql_string::EncodingType::Utf16 => {
+                let u16s: Vec<u16> = val.bytes.chunks_exact(2)
+                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                    .collect();
+                self.current_row.push(CellValue::Utf16(u16s));
+            }
+            _ => {
+                self.current_row.push(CellValue::String(val.to_utf8_string()));
+            }
+        }
+    }
+    fn write_bytes(&mut self, _col: usize, val: Vec<u8>) { self.current_row.push(CellValue::Bytes(val)); }
+    fn write_decimal(&mut self, _col: usize, val: DecimalParts) {
+        self.current_row.push(CellValue::Decimal { value: decimal_parts_to_i128(&val), precision: val.precision, scale: val.scale });
+    }
+    fn write_numeric(&mut self, _col: usize, val: DecimalParts) {
+        self.current_row.push(CellValue::Decimal { value: decimal_parts_to_i128(&val), precision: val.precision, scale: val.scale });
+    }
+    fn write_date(&mut self, _col: usize, val: SqlDate) {
+        self.current_row.push(CellValue::Date { days: sql_date_to_epoch_days(&val) });
+    }
+    fn write_time(&mut self, _col: usize, val: SqlTime) {
+        self.current_row.push(CellValue::Time { nanos: val.time_nanoseconds as i64 });
+    }
+    fn write_datetime(&mut self, _col: usize, val: SqlDateTime) {
+        self.current_row.push(CellValue::DateTime { micros: sql_datetime_to_micros(&val) });
+    }
+    fn write_smalldatetime(&mut self, _col: usize, val: SqlSmallDateTime) {
+        self.current_row.push(CellValue::DateTime { micros: sql_smalldatetime_to_micros(&val) });
+    }
+    fn write_datetime2(&mut self, _col: usize, val: SqlDateTime2) {
+        self.current_row.push(CellValue::DateTime { micros: sql_datetime2_to_micros(&val) });
+    }
+    fn write_datetimeoffset(&mut self, _col: usize, val: SqlDateTimeOffset) {
+        self.current_row.push(CellValue::DateTimeOffset { micros: sql_datetime2_to_micros(&val.datetime2), offset_min: val.offset });
+    }
+    fn write_money(&mut self, _col: usize, val: SqlMoney) {
+        self.current_row.push(CellValue::F64(sql_money_to_f64(&val)));
+    }
+    fn write_smallmoney(&mut self, _col: usize, val: SqlSmallMoney) {
+        self.current_row.push(CellValue::F64(val.int_val as f64 / 10000.0));
+    }
+    fn write_uuid(&mut self, _col: usize, val: Uuid) {
+        self.current_row.push(CellValue::Guid(*val.as_bytes()));
+    }
+    fn write_xml(&mut self, _col: usize, val: SqlXml) {
+        self.current_row.push(CellValue::String(val.as_string()));
+    }
+    fn write_json(&mut self, _col: usize, val: SqlJson) {
+        self.current_row.push(CellValue::String(val.as_string()));
+    }
+    fn write_vector(&mut self, _col: usize, _val: SqlVector) {
+        self.current_row.push(CellValue::String("[vector]".to_string()));
+    }
+    fn end_row(&mut self) {
+        self.rows.push_back(std::mem::take(&mut self.current_row));
+    }
+
+    fn cancel_row(&mut self) {
+        self.current_row.clear();
     }
 }
 
