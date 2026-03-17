@@ -47,6 +47,7 @@ pub async fn connect(context: JsClientContext) -> napi::Result<Connection> {
             let connection = Connection {
                 tds_client: Arc::new(Mutex::new(client)),
                 collation: Some(collation),
+                chunk_metadata: Arc::new(Mutex::new(None)),
             };
             Ok(connection)
         }

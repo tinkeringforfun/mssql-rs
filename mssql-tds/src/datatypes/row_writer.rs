@@ -42,6 +42,30 @@ pub trait RowWriter {
     fn write_json(&mut self, col: usize, val: SqlJson);
     fn write_vector(&mut self, col: usize, val: SqlVector);
     fn end_row(&mut self);
+
+    /// Write raw string bytes with encoding info, bypassing SqlString allocation.
+    /// `is_utf16`: true if bytes are UTF-16LE, false if UTF-8/ASCII.
+    /// Default impl wraps in SqlString for backward compatibility.
+    fn write_string_raw(&mut self, col: usize, bytes: Vec<u8>, is_utf16: bool) {
+        let enc = if is_utf16 {
+            crate::datatypes::sql_string::EncodingType::Utf16
+        } else {
+            crate::datatypes::sql_string::EncodingType::Utf8
+        };
+        self.write_string(col, SqlString::new(bytes, enc));
+    }
+
+    /// Returns the accumulated byte count of row data. Used for chunked
+    /// streaming to decide when to flush. Default returns 0 (no budget).
+    fn row_data_len(&self) -> usize {
+        0
+    }
+
+    /// Discard any partially-written column data for the current row.
+    /// Called when the synchronous fast-path decoder runs out of buffered
+    /// data mid-row and needs to fall back to the async decoder, which will
+    /// re-decode the entire row from the same buffer position.
+    fn cancel_row(&mut self) {}
 }
 
 /// Default implementation that assembles `Vec<ColumnValues>`, preserving
@@ -162,6 +186,10 @@ impl RowWriter for DefaultRowWriter {
 
     fn end_row(&mut self) {
         // No-op for DefaultRowWriter — row is taken via take_row().
+    }
+
+    fn cancel_row(&mut self) {
+        self.row.clear();
     }
 }
 

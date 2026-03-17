@@ -12,6 +12,7 @@ use crate::core::{
 };
 use crate::datatypes::decoder::GenericDecoder;
 use crate::datatypes::row_writer::RowWriter;
+use crate::datatypes::sync_decoder;
 use crate::error::Error::{OperationCancelledError, TimeoutError};
 use crate::error::TimeoutErrorType;
 use crate::handler::handler_factory::SessionSettings;
@@ -1422,6 +1423,53 @@ impl TdsTokenStreamReader for NetworkTransport {
             },
         }
         result
+    }
+
+    async fn receive_row_into_fast(
+        &mut self,
+        context: &ParserContext,
+        writer: &mut (dyn RowWriter + Send),
+    ) -> TdsResult<RowReadResult> {
+        // Try synchronous fast path: peek at the buffer and decode without async overhead.
+        // This avoids #[async_trait] boxing (~2M heap allocs for 100K×6col queries).
+        let buf = &self.tds_read_buffer;
+        let remaining = buf.buffer_length.saturating_sub(buf.buffer_position);
+
+        if remaining >= 2 {
+            // Peek at the token type byte
+            let token_byte = buf.working_buffer[buf.buffer_position];
+            if let Ok(token_type) = TokenType::try_from(token_byte) {
+                match token_type {
+                    TokenType::Row | TokenType::NbcRow => {
+                        if let ParserContext::ColumnMetadata(metadata) = context {
+                            let columns = &metadata.columns;
+                            let slice = &buf.working_buffer
+                                [buf.buffer_position + 1..buf.buffer_length];
+
+                            let result = if token_type == TokenType::Row {
+                                sync_decoder::decode_row_sync(slice, columns, writer)
+                            } else {
+                                sync_decoder::decode_nbcrow_sync(slice, columns, writer)
+                            };
+
+                            if let Ok(consumed) = result {
+                                // Success! Advance buffer position (1 for token byte + consumed)
+                                self.tds_read_buffer.consume_bytes(1 + consumed);
+                                return Ok(RowReadResult::RowWritten);
+                            }
+                            // BufferExhausted — discard any partially-written
+                            // columns before falling through to the async path
+                            // which will re-decode the entire row.
+                            writer.cancel_row();
+                        }
+                    }
+                    _ => {} // Non-row token — fall through to async path
+                }
+            }
+        }
+
+        // Async fallback
+        self.receive_row_into_internal(context, writer).await
     }
 }
 

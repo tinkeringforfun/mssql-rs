@@ -51,6 +51,7 @@ const TAG_DATETIME2 = 16;
 const TAG_DATETIMEOFFSET = 17;
 const TAG_MONEY = 18;
 const TAG_SMALLMONEY = 19;
+const TAG_STRING_INLINE = 20;
 
 const MAGIC = 0x4d535351; // "MSSQ"
 
@@ -139,16 +140,20 @@ export function decodeRawResult(buf: Buffer): RawResult {
   const stringDataStart = pos;
   const textDecoder = new globalThis.TextDecoder('utf-8');
 
-  function getString(idx: number): string {
-    if (idx < 0 || idx >= stringEntries.length) {
-      throw new Error(`Invalid string index: ${idx}`);
-    }
-    const entry = stringEntries[idx];
-    const bytes = buf.subarray(
-      stringDataStart + entry.offset,
-      stringDataStart + entry.offset + entry.len,
+  // Pre-decode all strings from the string table upfront
+  const strings: string[] = new Array(entryCount);
+  for (let i = 0; i < entryCount; i++) {
+    const entry = stringEntries[i];
+    strings[i] = textDecoder.decode(
+      buf.subarray(
+        stringDataStart + entry.offset,
+        stringDataStart + entry.offset + entry.len,
+      ),
     );
-    return textDecoder.decode(bytes);
+  }
+
+  function getString(idx: number): string {
+    return strings[idx];
   }
 
   // Compute total string data size to find row data start
@@ -169,7 +174,7 @@ export function decodeRawResult(buf: Buffer): RawResult {
   }
 
   // --- Row data ---
-  const rows: unknown[][] = [];
+  const rows: unknown[][] = new Array(rowCount);
 
   for (let r = 0; r < rowCount; r++) {
     const row: unknown[] = new Array(colCount);
@@ -224,6 +229,14 @@ export function decodeRawResult(buf: Buffer): RawResult {
           const idx = view.getUint32(pos, true);
           pos += 4;
           row[c] = getString(idx);
+          break;
+        }
+
+        case TAG_STRING_INLINE: {
+          const len = view.getUint32(pos, true);
+          pos += 4;
+          row[c] = textDecoder.decode(buf.subarray(pos, pos + len));
+          pos += len;
           break;
         }
 
@@ -370,7 +383,7 @@ export function decodeRawResult(buf: Buffer): RawResult {
           throw new Error(`Unknown cell tag ${tag} at offset ${pos - 1}`);
       }
     }
-    rows.push(row);
+    rows[r] = row;
   }
 
   return { columns, rows, rowCount, rowsAffected };
