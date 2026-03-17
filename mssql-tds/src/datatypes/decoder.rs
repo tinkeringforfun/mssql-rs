@@ -1310,10 +1310,11 @@ impl StringDecoder {
         W: RowWriter + ?Sized,
     {
         let encoding_type = get_encoding_type(metadata);
+        let is_utf16 = matches!(encoding_type, crate::datatypes::sql_string::EncodingType::Utf16);
 
         if metadata.is_plp() {
             match GenericDecoder::read_plp_bytes(reader).await? {
-                Some(bytes) => writer.write_string(col, SqlString::new(bytes, encoding_type)),
+                Some(bytes) => writer.write_string_raw(col, bytes, is_utf16),
                 None => writer.write_null(col),
             }
         } else if Self::is_long_len_type(metadata.data_type) {
@@ -1335,14 +1336,13 @@ impl StringDecoder {
                 )));
             }
 
-            let sql_string = if length == 0 {
-                SqlString::new(Vec::new(), encoding_type)
+            if length == 0 {
+                writer.write_string_raw(col, Vec::new(), is_utf16);
             } else {
                 let mut buffer = vec![0u8; length];
                 reader.read_bytes(&mut buffer).await?;
-                SqlString::new(buffer, encoding_type)
+                writer.write_string_raw(col, buffer, is_utf16);
             };
-            writer.write_string(col, sql_string);
         } else {
             let length = reader.read_uint16().await? as usize;
             if length == 0xFFFF {
@@ -1350,7 +1350,7 @@ impl StringDecoder {
             } else {
                 let mut buffer = vec![0u8; length];
                 reader.read_bytes(&mut buffer).await?;
-                writer.write_string(col, SqlString::new(buffer, encoding_type));
+                writer.write_string_raw(col, buffer, is_utf16);
             }
         }
         Ok(())

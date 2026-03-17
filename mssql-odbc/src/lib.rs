@@ -153,6 +153,10 @@ fn alloc_handle_impl(
                 current_row: Vec::new(),
                 prefetch_buffer: std::collections::VecDeque::new(),
                 prefetch_done: None,
+                bound_cols: Vec::new(),
+                row_array_size: 1,
+                rows_fetched_ptr: ptr::null_mut(),
+                row_status_ptr: ptr::null_mut(),
             });
             let stmt_ptr = Box::into_raw(stmt);
             if !input_handle.is_null() {
@@ -411,7 +415,11 @@ pub extern "C" fn SQLFetch(hstmt: SQLHSTMT) -> SQLRETURN {
         return SQL_INVALID_HANDLE;
     }
     let stmt = unsafe { &mut *(hstmt as *mut Statement) };
-    fetch::fetch(stmt)
+    let rc = fetch::fetch(stmt);
+    if rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO {
+        fetch::fill_bound_cols(stmt);
+    }
+    rc
 }
 
 #[unsafe(no_mangle)]
@@ -1586,15 +1594,34 @@ fn format_float_f64(v: f64) -> String {
 #[unsafe(no_mangle)]
 pub extern "C" fn SQLBindCol(
     hstmt: SQLHSTMT,
-    _col_number: SQLUSMALLINT,
-    _target_type: SQLSMALLINT,
-    _target_value: SQLPOINTER,
-    _buffer_length: SQLLEN,
-    _str_len_or_ind: *mut SQLLEN,
+    col_number: SQLUSMALLINT,
+    target_type: SQLSMALLINT,
+    target_value: SQLPOINTER,
+    buffer_length: SQLLEN,
+    str_len_or_ind: *mut SQLLEN,
 ) -> SQLRETURN {
     if hstmt.is_null() {
         return SQL_INVALID_HANDLE;
     }
+    let stmt = unsafe { &mut *(hstmt as *mut Statement) };
+    let idx = col_number as usize; // 1-based
+
+    // Ensure bound_cols is large enough
+    while stmt.bound_cols.len() < idx + 1 {
+        stmt.bound_cols.push(None);
+    }
+
+    if target_value.is_null() {
+        stmt.bound_cols[idx] = None;
+    } else {
+        stmt.bound_cols[idx] = Some(BoundCol {
+            target_type,
+            target_value,
+            buffer_length,
+            str_len_or_ind,
+        });
+    }
+
     SQL_SUCCESS
 }
 
@@ -2035,6 +2062,8 @@ pub extern "C" fn SQLGetFunctions(
                 1016, // SQL_API_SQLSETCONNECTATTR
                 1019, // SQL_API_SQLSETENVATTR
                 1020, // SQL_API_SQLSETSTMTATTR
+                1021, // SQL_API_SQLFETCHSCROLL
+                4,    // SQL_API_SQLBINDCOL
             ];
             for &f in supported_funcs {
                 let word = (f >> 4) as usize;
@@ -2553,12 +2582,46 @@ pub extern "C" fn SQLFetchScroll(
     fetch_orientation: SQLSMALLINT,
     _fetch_offset: SQLLEN,
 ) -> SQLRETURN {
-    if fetch_orientation == SQL_FETCH_NEXT {
-        SQLFetch(hstmt)
-    } else if hstmt.is_null() {
-        SQL_INVALID_HANDLE
+    if hstmt.is_null() {
+        return SQL_INVALID_HANDLE;
+    }
+    if fetch_orientation != SQL_FETCH_NEXT {
+        return SQL_ERROR;
+    }
+    let stmt = unsafe { &mut *(hstmt as *mut Statement) };
+    let array_size = stmt.row_array_size.max(1);
+
+    let mut rows_fetched: usize = 0;
+
+    for row_in_batch in 0..array_size {
+        let rc = fetch::fetch(stmt);
+        if rc == SQL_NO_DATA {
+            if !stmt.row_status_ptr.is_null() {
+                unsafe { *stmt.row_status_ptr.add(row_in_batch) = SQL_ROW_NOROW; }
+            }
+            break;
+        }
+        if rc != SQL_SUCCESS && rc != SQL_SUCCESS_WITH_INFO {
+            if !stmt.row_status_ptr.is_null() {
+                unsafe { *stmt.row_status_ptr.add(row_in_batch) = SQL_ROW_ERROR; }
+            }
+            break;
+        }
+        fetch::fill_bound_cols_at(stmt, row_in_batch);
+        if !stmt.row_status_ptr.is_null() {
+            unsafe { *stmt.row_status_ptr.add(row_in_batch) = SQL_ROW_SUCCESS; }
+        }
+        rows_fetched += 1;
+    }
+
+    if !stmt.rows_fetched_ptr.is_null() {
+        unsafe { *stmt.rows_fetched_ptr = rows_fetched as SQLULEN; }
+    }
+
+    if rows_fetched == 0 {
+        SQL_NO_DATA
     } else {
-        SQL_ERROR
+        SQL_SUCCESS
     }
 }
 
