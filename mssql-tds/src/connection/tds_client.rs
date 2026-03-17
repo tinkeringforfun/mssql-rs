@@ -970,7 +970,6 @@ impl TdsClient {
         }
         let parser_context = ParserContext::ColumnMetadata(self.current_metadata.clone().unwrap());
         loop {
-            let start = Instant::now();
             let result = self
                 .transport
                 .receive_row_into(
@@ -980,12 +979,11 @@ impl TdsClient {
                     writer,
                 )
                 .await?;
-            self.update_remaining_timeout(start);
 
             match result {
                 RowReadResult::RowWritten => {
                     writer.end_row();
-                    info!("Row Received");
+                    // row received;
                     return Ok(true);
                 }
                 RowReadResult::Token(token) => match token {
@@ -1040,6 +1038,176 @@ impl TdsClient {
                     _ => {
                         return Err(crate::error::Error::ProtocolError(format!(
                             "Unexpected token while finding the next row: {token:?}"
+                        )));
+                    }
+                },
+            }
+        }
+    }
+
+    /// Bulk fetch rows using the normal (non-fast) path but caching the parser context.
+    /// Avoids per-row metadata clone overhead.
+    pub async fn bulk_fetch_rows_normal(
+        &mut self,
+        writer: &mut (dyn RowWriter + Send),
+        max_rows: usize,
+    ) -> TdsResult<(usize, bool)> {
+        if self.current_metadata.is_none() {
+            return Err(UsageError(
+                "No metadata found".to_string(),
+            ));
+        }
+        let parser_context = ParserContext::ColumnMetadata(self.current_metadata.clone().unwrap());
+        let mut count = 0usize;
+
+        loop {
+            if count >= max_rows {
+                return Ok((count, false));
+            }
+            let result = self
+                .transport
+                .receive_row_into(
+                    &parser_context,
+                    self.remaining_request_timeout,
+                    self.cancel_handle.as_ref(),
+                    writer,
+                )
+                .await?;
+
+            match result {
+                RowReadResult::RowWritten => {
+                    writer.end_row();
+                    count += 1;
+                }
+                RowReadResult::Token(token) => match token {
+                    Tokens::DoneInProc(done) | Tokens::DoneProc(done) | Tokens::Done(done) => {
+                        let cnt = self.count_map.entry(done.cur_cmd).or_insert(0);
+                        *cnt = cnt.saturating_add(done.row_count);
+                        self.current_result_set_has_been_read_till_end = true;
+                        if !done.has_more() {
+                            self.execution_context.set_has_open_batch(false);
+                        }
+                        return Ok((count, true));
+                    }
+                    Tokens::Order(_) => continue,
+                    Tokens::EnvChange(env_change) => {
+                        self.execution_context.capture_change_property(&env_change)?;
+                        continue;
+                    }
+                    Tokens::ReturnValue(return_value_token) => {
+                        self.return_values.push(return_value_token.into());
+                        continue;
+                    }
+                    Tokens::Error(error_token) => {
+                        return Err(crate::error::Error::SqlServerError {
+                            message: error_token.message.clone(),
+                            state: error_token.state,
+                            class: error_token.severity as i32,
+                            number: error_token.number,
+                            server_name: Some(error_token.server_name.clone()),
+                            proc_name: Some(error_token.proc_name.clone()),
+                            line_number: Some(error_token.line_number as i32),
+                        });
+                    }
+                    _ => {
+                        return Err(crate::error::Error::ProtocolError(format!(
+                            "Unexpected token: {token:?}"
+                        )));
+                    }
+                },
+            }
+        }
+    }
+
+    /// Drains all rows from the current result set into a [`RowWriter`] in a
+    /// tight loop, avoiding per-row tracing spans, `Instant::now()` calls, and
+    /// timeout recalculation.  Timeout is checked once before entering the loop.
+    ///
+    /// Returns the number of rows written.
+    pub async fn drain_all_rows_into(
+        &mut self,
+        writer: &mut (dyn RowWriter + Send),
+    ) -> TdsResult<u64> {
+        self.drain_rows_into_with_budget(writer, usize::MAX).await
+    }
+
+    /// Drain rows using the fast path (sync decode + async fallback), stopping
+    /// when either the result set is exhausted or `byte_budget` bytes of row
+    /// data have been accumulated (checked via `RowWriter::row_data_len()`).
+    ///
+    /// Returns `(row_count, exhausted)` where `exhausted` is true if the
+    /// result set is fully consumed.
+    pub async fn drain_rows_into_with_budget(
+        &mut self,
+        writer: &mut (dyn RowWriter + Send),
+        byte_budget: usize,
+    ) -> TdsResult<u64> {
+        if self.current_metadata.is_none() {
+            return Err(UsageError(
+                "No metadata found. Have you called execute?".to_string(),
+            ));
+        }
+        let parser_context = ParserContext::ColumnMetadata(self.current_metadata.clone().unwrap());
+        let mut row_count: u64 = 0;
+
+        loop {
+            let result = self
+                .transport
+                .receive_row_into_fast(
+                    &parser_context,
+                    writer,
+                )
+                .await?;
+
+            match result {
+                RowReadResult::RowWritten => {
+                    writer.end_row();
+                    row_count += 1;
+                    // Check byte budget for chunked streaming
+                    if writer.row_data_len() >= byte_budget {
+                        return Ok(row_count);
+                    }
+                }
+                RowReadResult::Token(token) => match token {
+                    Tokens::DoneInProc(done) | Tokens::DoneProc(done) | Tokens::Done(done) => {
+                        let count = self.count_map.entry(done.cur_cmd).or_insert(0);
+                        *count = count.saturating_add(done.row_count);
+                        self.current_result_set_has_been_read_till_end = true;
+                        if !done.has_more() {
+                            self.execution_context.set_has_open_batch(false);
+                        }
+                        return Ok(row_count);
+                    }
+                    Tokens::Order(_) | Tokens::EnvChange(_) => {
+                        if let Tokens::EnvChange(ref env_change) = token {
+                            self.execution_context
+                                .capture_change_property(env_change)?;
+                        }
+                        continue;
+                    }
+                    Tokens::ReturnValue(return_value_token) => {
+                        self.return_values.push(return_value_token.into());
+                        continue;
+                    }
+                    Tokens::Error(error_token) => {
+                        return Err(crate::error::Error::SqlServerError {
+                            message: error_token.message.clone(),
+                            state: error_token.state,
+                            class: error_token.severity as i32,
+                            number: error_token.number,
+                            server_name: Some(error_token.server_name.clone()),
+                            proc_name: Some(error_token.proc_name.clone()),
+                            line_number: Some(error_token.line_number as i32),
+                        });
+                    }
+                    Tokens::ColMetadata(_) => {
+                        return Err(crate::error::Error::UsageError(
+                            "Unexpected ColMetadata token while draining rows.".to_string(),
+                        ));
+                    }
+                    _ => {
+                        return Err(crate::error::Error::ProtocolError(format!(
+                            "Unexpected token while draining rows: {token:?}"
                         )));
                     }
                 },
@@ -1319,12 +1487,34 @@ impl ResultSet for TdsClient {
         }
     }
 
-    #[instrument(skip(self, writer), level = "info")]
     async fn next_row_into(&mut self, writer: &mut (dyn RowWriter + Send)) -> TdsResult<bool> {
         if self.maybe_has_unread_rows() {
             self.get_next_row_into(writer).await
         } else {
             Ok(false)
+        }
+    }
+
+    async fn drain_all_rows_into(
+        &mut self,
+        writer: &mut (dyn RowWriter + Send),
+    ) -> TdsResult<u64> {
+        if self.maybe_has_unread_rows() {
+            TdsClient::drain_all_rows_into(self, writer).await
+        } else {
+            Ok(0)
+        }
+    }
+
+    async fn drain_rows_into_with_budget(
+        &mut self,
+        writer: &mut (dyn RowWriter + Send),
+        byte_budget: usize,
+    ) -> TdsResult<u64> {
+        if self.maybe_has_unread_rows() {
+            TdsClient::drain_rows_into_with_budget(self, writer, byte_budget).await
+        } else {
+            Ok(0)
         }
     }
 
@@ -1398,6 +1588,21 @@ pub trait ResultSet {
     /// Decodes the next row directly into a [`RowWriter`], returning `true` if
     /// a row was written or `false` when the result set is exhausted.
     async fn next_row_into(&mut self, writer: &mut (dyn RowWriter + Send)) -> TdsResult<bool>;
+
+    /// Drains all remaining rows in the current result set into a [`RowWriter`]
+    /// using a tight loop with minimal per-row overhead.  Returns the row count.
+    async fn drain_all_rows_into(
+        &mut self,
+        writer: &mut (dyn RowWriter + Send),
+    ) -> TdsResult<u64>;
+
+    /// Drain rows using the fast path, stopping when byte_budget is reached
+    /// or the result set is exhausted. Returns row count.
+    async fn drain_rows_into_with_budget(
+        &mut self,
+        writer: &mut (dyn RowWriter + Send),
+        byte_budget: usize,
+    ) -> TdsResult<u64>;
 
     fn maybe_has_unread_rows(&self) -> bool;
 

@@ -55,6 +55,14 @@ pub(crate) trait TdsTokenStreamReader {
         cancel_handle: Option<&CancelHandle>,
         writer: &mut (dyn RowWriter + Send),
     ) -> TdsResult<RowReadResult>;
+
+    /// Fast path: decode the next row/token without per-call timeout or
+    /// cancellation checks.  Used by `drain_all_rows_into` for tight loops.
+    async fn receive_row_into_fast(
+        &mut self,
+        context: &ParserContext,
+        writer: &mut (dyn RowWriter + Send),
+    ) -> TdsResult<RowReadResult>;
 }
 
 #[async_trait]
@@ -72,6 +80,12 @@ pub trait TdsTokenStreamReader {
         context: &ParserContext,
         remaining_request_timeout: Option<Duration>,
         cancel_handle: Option<&CancelHandle>,
+        writer: &mut (dyn RowWriter + Send),
+    ) -> TdsResult<RowReadResult>;
+
+    async fn receive_row_into_fast(
+        &mut self,
+        context: &ParserContext,
         writer: &mut (dyn RowWriter + Send),
     ) -> TdsResult<RowReadResult>;
 }
@@ -337,6 +351,14 @@ where
             },
         }
         result
+    }
+
+    async fn receive_row_into_fast(
+        &mut self,
+        context: &ParserContext,
+        writer: &mut (dyn RowWriter + Send),
+    ) -> TdsResult<RowReadResult> {
+        self.receive_row_into_internal(context, writer).await
     }
 }
 #[cfg(not(fuzzing))]

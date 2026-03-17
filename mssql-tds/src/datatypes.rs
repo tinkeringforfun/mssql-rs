@@ -12,4 +12,5 @@ pub mod sql_string;
 pub mod sql_vector;
 pub mod sqldatatypes;
 pub mod sqltypes;
+pub(crate) mod sync_decoder;
 pub mod tds_value_serializer;
