@@ -1,0 +1,15 @@
+[package]
+name = "mssql-odbc"
+version = "0.1.0"
+edition = "2024"
+description = "ODBC driver for SQL Server using mssql-tds"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+mssql-tds = { path = "../mssql-tds", default-features = false }
+tokio = { version = "1.48.0", features = ["rt-multi-thread", "macros"] }
+parking_lot = "0.12"
+uuid = "1.19.0"
