@@ -766,6 +766,11 @@ impl NetworkTransport {
     ///
     /// The fix ensures all bytes from `read()` are accounted for, not just the first packet.
     async fn get_new_tds_packet(&mut self) -> TdsResult<usize> {
+        #[cfg(feature = "otel")]
+        let otel_active = crate::io::packet_reader::otel_metrics::is_enabled();
+        #[cfg(feature = "otel")]
+        let packet_start = if otel_active { Some(std::time::Instant::now()) } else { None };
+
         let base_offset = self.tds_read_buffer.buffer_length;
 
         // Check if we have pending bytes from a previous read that included multiple packets
@@ -799,6 +804,8 @@ impl NetworkTransport {
 
         // Read more data if we don't have enough for the header
         while bytes_available < PacketWriter::PACKET_HEADER_SIZE {
+            #[cfg(feature = "otel")]
+            let recv_start = if otel_active { Some(std::time::Instant::now()) } else { None };
             let bytes_read = stream
                 .read(&mut self.tds_read_buffer.working_buffer[base_offset + bytes_available..])
                 .await?;
@@ -806,6 +813,12 @@ impl NetworkTransport {
                 return Err(crate::error::Error::ConnectionClosed(
                     "Connection closed by server while reading TDS packet header".to_string(),
                 ));
+            }
+            #[cfg(feature = "otel")]
+            if let Some(start) = recv_start {
+                let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+                crate::io::packet_reader::otel_metrics::NETWORK_READ_DURATION.record(elapsed, &[]);
+                crate::io::packet_reader::otel_metrics::NETWORK_READ_BYTES.record(bytes_read as f64, &[]);
             }
             bytes_available += bytes_read;
         }
@@ -844,6 +857,8 @@ impl NetworkTransport {
 
         // Keep reading until we have the complete packet in memory.
         while bytes_available < packet_size_from_header {
+            #[cfg(feature = "otel")]
+            let recv_start = if otel_active { Some(std::time::Instant::now()) } else { None };
             let bytes_read = stream
                 .read(&mut self.tds_read_buffer.working_buffer[base_offset + bytes_available..])
                 .await?;
@@ -851,6 +866,12 @@ impl NetworkTransport {
                 return Err(crate::error::Error::ConnectionClosed(
                     "Connection closed by server while reading TDS packet payload".to_string(),
                 ));
+            }
+            #[cfg(feature = "otel")]
+            if let Some(start) = recv_start {
+                let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+                crate::io::packet_reader::otel_metrics::NETWORK_READ_DURATION.record(elapsed, &[]);
+                crate::io::packet_reader::otel_metrics::NETWORK_READ_BYTES.record(bytes_read as f64, &[]);
             }
             bytes_available += bytes_read;
         }
@@ -865,6 +886,12 @@ impl NetworkTransport {
         } else {
             self.tds_read_buffer.pending_bytes = 0;
             self.tds_read_buffer.pending_bytes_offset = 0;
+        }
+
+        #[cfg(feature = "otel")]
+        if let Some(start) = packet_start {
+            let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+            crate::io::packet_reader::otel_metrics::PACKET_READ_DURATION.record(elapsed, &[]);
         }
 
         event!(

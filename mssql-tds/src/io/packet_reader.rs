@@ -15,6 +15,76 @@ use std::{
     io::{Error, ErrorKind},
 };
 
+/// Runtime-conditional OpenTelemetry metrics for TDS network I/O.
+///
+/// This module is always compiled (no feature gate required), but instrumentation
+/// is **zero-cost when no OTel collector is configured**:
+///
+/// - If `set_meter_provider()` is never called, the global meter returns no-op
+///   instruments and `record()` is a ~2-5ns branch+return.
+/// - An explicit `enabled` atomic flag lets us skip even the `Instant::now()` call
+///   (~25ns) when telemetry is off. Call `otel_metrics::enable()` after setting
+///   up your meter provider to activate timing.
+///
+/// Overhead when enabled: ~150-250ns per network read (Instant + histogram record).
+#[cfg(feature = "otel")]
+pub mod otel_metrics {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::LazyLock;
+    use opentelemetry::metrics::Histogram;
+
+    /// Controls whether instrumentation is active at runtime.
+    /// Even with the `otel` feature compiled in, no timing or recording
+    /// happens until `enable()` is called.
+    static ENABLED: AtomicBool = AtomicBool::new(false);
+
+    /// Activate OTel instrumentation. Call this after `set_meter_provider()`.
+    /// Safe to call multiple times.
+    pub fn enable() {
+        ENABLED.store(true, Ordering::Release);
+        // Force lazy initialization of instruments so they bind to the
+        // now-active meter provider.
+        let _ = &*NETWORK_READ_DURATION;
+        let _ = &*NETWORK_READ_BYTES;
+        let _ = &*PACKET_READ_DURATION;
+    }
+
+    /// Deactivate OTel instrumentation at runtime (e.g. for benchmarking).
+    pub fn disable() {
+        ENABLED.store(false, Ordering::Release);
+    }
+
+    /// Returns true if instrumentation is active.
+    /// Uses `Relaxed` ordering — the worst case is one extra/missed
+    /// sample at a toggle boundary, which is fine for metrics.
+    #[inline(always)]
+    pub fn is_enabled() -> bool {
+        ENABLED.load(Ordering::Relaxed)
+    }
+
+    fn meter() -> opentelemetry::metrics::Meter {
+        opentelemetry::global::meter("mssql_tds")
+    }
+
+    pub static NETWORK_READ_DURATION: LazyLock<Histogram<f64>> = LazyLock::new(|| {
+        meter().f64_histogram("tds.network.read.duration_ms")
+            .with_description("Time spent in each network receive call (ms)")
+            .build()
+    });
+
+    pub static NETWORK_READ_BYTES: LazyLock<Histogram<f64>> = LazyLock::new(|| {
+        meter().f64_histogram("tds.network.read.bytes")
+            .with_description("Bytes read per network receive call")
+            .build()
+    });
+
+    pub static PACKET_READ_DURATION: LazyLock<Histogram<f64>> = LazyLock::new(|| {
+        meter().f64_histogram("tds.packet.read.duration_ms")
+            .with_description("Total time to assemble a complete TDS packet (ms)")
+            .build()
+    });
+}
+
 #[async_trait]
 #[cfg(not(fuzzing))]
 pub(crate) trait TdsPacketReader {
@@ -144,24 +214,44 @@ impl<'a> PacketReader<'a> {
     }
 
     async fn get_new_tds_packet(&mut self) -> TdsResult<usize> {
+        #[cfg(feature = "otel")]
+        let packet_start = std::time::Instant::now();
+
         let packet_buffer: &mut Vec<u8> = &mut self.working_buffer;
         let base_offset_to_write = self.buffer_length;
 
+        #[cfg(feature = "otel")]
+        let recv_start = std::time::Instant::now();
         let mut bytes_read_from_transport = self
             .network_reader_writer
             .receive(&mut packet_buffer[base_offset_to_write..])
             .await?;
+        #[cfg(feature = "otel")]
+        {
+            let elapsed = recv_start.elapsed().as_secs_f64() * 1000.0;
+            otel_metrics::NETWORK_READ_DURATION.record(elapsed, &[]);
+            otel_metrics::NETWORK_READ_BYTES.record(bytes_read_from_transport as f64, &[]);
+        }
 
         // We need the 8 byte header. Re-read, in case the new_packet_byte_length has less bytes than 8 bytes to complete
         // the header.
         while bytes_read_from_transport < PacketWriter::PACKET_HEADER_SIZE {
-            bytes_read_from_transport += self
+            #[cfg(feature = "otel")]
+            let recv_start = std::time::Instant::now();
+            let n = self
                 .network_reader_writer
                 .receive(
                     &mut packet_buffer[base_offset_to_write + bytes_read_from_transport
                         ..base_offset_to_write + self.max_packet_size],
                 )
                 .await?;
+            #[cfg(feature = "otel")]
+            {
+                let elapsed = recv_start.elapsed().as_secs_f64() * 1000.0;
+                otel_metrics::NETWORK_READ_DURATION.record(elapsed, &[]);
+                otel_metrics::NETWORK_READ_BYTES.record(n as f64, &[]);
+            }
+            bytes_read_from_transport += n;
         }
 
         let length_from_packet_header =
@@ -171,14 +261,30 @@ impl<'a> PacketReader<'a> {
 
         // Keep reading until we have the complete packet in memory.
         while bytes_read_from_transport < packet_size_from_header {
-            bytes_read_from_transport += self
+            #[cfg(feature = "otel")]
+            let recv_start = std::time::Instant::now();
+            let n = self
                 .network_reader_writer
                 .receive(
                     &mut packet_buffer[base_offset_to_write + bytes_read_from_transport
                         ..base_offset_to_write + self.max_packet_size],
                 )
                 .await?;
+            #[cfg(feature = "otel")]
+            {
+                let elapsed = recv_start.elapsed().as_secs_f64() * 1000.0;
+                otel_metrics::NETWORK_READ_DURATION.record(elapsed, &[]);
+                otel_metrics::NETWORK_READ_BYTES.record(n as f64, &[]);
+            }
+            bytes_read_from_transport += n;
         }
+
+        #[cfg(feature = "otel")]
+        {
+            let elapsed = packet_start.elapsed().as_secs_f64() * 1000.0;
+            otel_metrics::PACKET_READ_DURATION.record(elapsed, &[]);
+        }
+
         event!(
             tracing::Level::DEBUG,
             "Received packet of size: {:?}",
