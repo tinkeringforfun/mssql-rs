@@ -117,12 +117,25 @@ impl ParsedDataSource {
             return Self::parse_localdb(original, &normalized, parallel_connect);
         }
 
-        // On non-Windows platforms, reject LocalDB with a clear error message
-        #[cfg(not(windows))]
+        // On non-Windows platforms with the localdb feature, intercept special hostnames
+        // and route them to the container-based LocalDB.
+        #[cfg(all(not(windows), feature = "localdb"))]
+        {
+            let is_localdb = normalized.starts_with("(localdb)\\") || normalized.starts_with("(localdb)/")
+                || normalized == "(localdb)" || normalized == "makeitwork"
+                || normalized.starts_with("localdb://");
+            if is_localdb {
+                return Self::parse_linux_localdb(original);
+            }
+        }
+
+        // On non-Windows platforms without localdb feature, reject LocalDB
+        #[cfg(all(not(windows), not(feature = "localdb")))]
         if normalized.starts_with("(localdb)\\") || normalized.starts_with("(localdb)/") {
             return Err(Error::ProtocolError(
                 "LocalDB is not supported on this platform. LocalDB is a Windows-only feature. \
-                 Use a TCP connection string instead (e.g., 'tcp:server,port')."
+                 Use a TCP connection string instead (e.g., 'tcp:server,port'), or enable the \
+                 'localdb' feature for container-based LocalDB."
                     .to_string(),
             ));
         }
@@ -596,7 +609,26 @@ impl ParsedDataSource {
         Ok(result)
     }
 
-    /// Check if the given name matches the computer name
+    /// Parse a Linux LocalDB connection string.
+    ///
+    /// When the `localdb` feature is enabled on non-Windows, special hostnames
+    /// like `(localdb)`, `makeitwork`, or `localdb://` are resolved to a
+    /// container-managed SQL Server instance at connection time. We return a
+    /// TCP parse result pointing at a placeholder that will be overridden by
+    /// the connection provider.
+    #[cfg(all(not(windows), feature = "localdb"))]
+    fn parse_linux_localdb(original: &str) -> TdsResult<ParsedDataSource> {
+        let mut result = ParsedDataSource::new();
+        result.protocol_name = "linux-localdb".to_string();
+        result.server_name = original.to_string();
+        result.original_server_name = original.to_string();
+        // Port 0 signals "to be resolved at connect time"
+        result.protocol_parameter = "0".to_string();
+        result.can_use_cache = false;
+        result.alias = original.to_string();
+        result.parallel_connect = false;
+        Ok(result)
+    }
     fn is_computer_name(name: &str) -> bool {
         // Get computer name and compare
         if let Some(computer_name) = Self::get_computer_name() {
@@ -717,6 +749,15 @@ impl ParsedDataSource {
         if self.protocol_name == "localdb" {
             builder.add_resolve_localdb(&self.instance_name);
             builder.add_connect_named_pipe_from_slot(ResultSlot::ResolvedPipePath);
+            return builder.build();
+        }
+
+        // Linux LocalDB: connect to container-managed SQL Server
+        #[cfg(all(not(windows), feature = "localdb"))]
+        if self.protocol_name == "linux-localdb" {
+            // Port 0 is a sentinel: the connection provider will resolve it
+            // by starting/finding the container.
+            builder.add_connect_tcp(&self.server_name, 0);
             return builder.build();
         }
 

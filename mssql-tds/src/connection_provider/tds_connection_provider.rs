@@ -172,7 +172,42 @@ impl TdsConnectionProvider {
             };
 
             #[cfg(not(windows))]
-            let (transport_contexts, context) = (action_chain.resolve_transport_contexts(), context.clone());
+            let (transport_contexts, context) = {
+                #[cfg(feature = "localdb")]
+                {
+                    // Check if the action chain contains a linux-localdb connection
+                    let linux_localdb = action_chain.resolve_transport_contexts().iter().any(|(tc, _)| {
+                        matches!(tc, TransportContext::Tcp { host, port, .. } if *port == 0 && !host.is_empty())
+                    });
+                    if linux_localdb {
+                        debug!("Linux LocalDB detected, starting container");
+                        let instance = mssql_container::get_or_start().await.map_err(|e| {
+                            Error::ProtocolError(format!("Failed to start LocalDB container: {e}"))
+                        })?;
+                        let mut modified_context = context.clone();
+                        // Use the container's SA password if the user didn't set one
+                        if modified_context.user_name == "sa" && modified_context.password.is_empty() {
+                            modified_context.password = instance.sa_password.clone();
+                        }
+                        if modified_context.user_name.is_empty() {
+                            modified_context.user_name = "sa".to_string();
+                            modified_context.password = instance.sa_password.clone();
+                        }
+                        let tc = TransportContext::Tcp {
+                            host: instance.host.clone(),
+                            port: instance.port,
+                            instance_name: None,
+                        };
+                        (vec![(tc, modified_context.connect_timeout as u64 * 1000)], modified_context)
+                    } else {
+                        (action_chain.resolve_transport_contexts(), context.clone())
+                    }
+                }
+                #[cfg(not(feature = "localdb"))]
+                {
+                    (action_chain.resolve_transport_contexts(), context.clone())
+                }
+            };
 
             if transport_contexts.is_empty() {
                 return Err(Error::ProtocolError(

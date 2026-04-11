@@ -16,10 +16,12 @@ sspi = []
 gssapi = []
 # Enable both SSPI and GSSAPI for cross-platform integrated authentication
 integrated-auth = ["sspi", "gssapi"]
+# Linux LocalDB: auto-start a SQL Server container via mssql-container
+localdb = ["mssql-container"]
 
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)', 'cfg(feature, values("sspi", "gssapi", "integrated-auth"))'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)', 'cfg(feature, values("sspi", "gssapi", "integrated-auth", "localdb"))'] }
 
 [dependencies]
 async-trait = "0.1.89"
@@ -46,6 +48,9 @@ encoding_rs = "0.8"
 x509-parser = "0.18.0"
 # For DNS resolution (reverse DNS lookup for SPN canonicalization)
 dns-lookup = "2.0"
+
+# Optional: Linux LocalDB container support
+mssql-container = { path = "../mssql-container", optional = true }
 
 
 
